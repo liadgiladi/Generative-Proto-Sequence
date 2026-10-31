@@ -2038,11 +2038,33 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                         unique_next_state_target_action_list_final = [np.array(arr) for arr in
                                                                       unique_next_state_target_action_list_final]
 
+                        # NOTE: next_state_embeddings is (batch, n_heads, embedding_dim), and
+                        # dim=2 reduces the *head* axis, not the embedding axis -- so this is
+                        # not embedding similarity between states. At n_heads=1 the vectors
+                        # have length 1 and cosine degenerates to sign agreement; at n_heads=5
+                        # it compares a different quantity entirely, which is why A2 reported
+                        # 0.952 against a 1-head baseline of 0.619 (see §9). Kept unchanged so
+                        # historical runs stay comparable -- the §8.6 MLP-vs-GPT trajectory
+                        # (1.0 -> 0.507 vs 0.706 -> 0.619) is in these units.
                         cosine_similarity_all_pairs = torch.cosine_similarity(next_state_embeddings.unsqueeze(1),
                                                                               next_state_embeddings.unsqueeze(0),
                                                                               dim=2)
                         cosine_similarity_all_pairs_mean = cosine_similarity_all_pairs.mean().item()
                         cosine_similarity_between_first_to_others_mean = cosine_similarity_all_pairs[0].mean().item()
+
+                        # Correct version: pairwise cosine between the per-state embeddings of
+                        # head 0, reduced over the embedding axis, with self-pairs excluded.
+                        # 1.0 means the actor emits the same embedding for every state. This is
+                        # the quantity check_z_influence.py reports (0.7783 on earthy-bird-16),
+                        # so the two are directly comparable, and it is comparable across head
+                        # counts -- which the metric above is not.
+                        head0_embeddings = F.normalize(next_state_embeddings[:, 0, :], p=2, dim=1)
+                        head0_similarity = head0_embeddings @ head0_embeddings.T
+                        off_diagonal_mask = ~torch.eye(head0_similarity.shape[0], dtype=torch.bool,
+                                                       device=head0_similarity.device)
+                        actor_embedding_cosine = head0_similarity[off_diagonal_mask].mean().item()
+                        print(f"actor embedding cosine (head 0, excl. self): {actor_embedding_cosine}")
+                        writer.add_scalar("actor/embedding_cosine", actor_embedding_cosine, global_step)
 
                         _, counts = torch.unique(batch_next_observations.clone().cpu(), dim=0, return_counts=True)
                         num_same_states = (counts > 1).sum().item()

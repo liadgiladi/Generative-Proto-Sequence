@@ -715,3 +715,83 @@ before they are worth retrying.
 |---|---|---|
 | `sbatch/a3_length.sbatch` | 1 candidate, `--sequence_length_weight 5e-4`, band `4`–`10`, `--min_qf_value -20.0` | Single-element length bands because the penalty asserts `len(min_lengths_per_head) == n_proto_plan_candidates`. Weight raised from 1e-4 since the sum is now over 256 terms, not 1280. |
 | `sbatch/b2_soft_feedback.sbatch` | 1 candidate, `--decoder_soft_token_feedback`, `--min_qf_value -20.0` | Single variable against the 0.53-val baseline. |
+
+### 9.5 Result — the length penalty works
+
+| run | test (stochastic) | test (deterministic) | best val | best step | hours |
+|---|---|---|---|---|---|
+| baseline, deterministic, 1M | 0.432 | 0.329 | 0.49 | 330,000 | 11.29 |
+| baseline, non-deterministic, 1M | 0.403 | 0.318 | 0.45 | 355,000 | 7.62 |
+| **A3 — length penalty, 500k** | **0.582** | **0.511** | **0.61** | 265,000 | 4.26 |
+| B2 — soft feedback, 500k | 0.479 | 0.400 | 0.55 | 225,000 | 5.50 |
+| *prior GPT run (`eager-lion-9`)* | *0.509* | — | — | — | — |
+| *MLP baseline* | *0.794* | — | — | — | — |
+
+**A3 is the first GPT configuration to beat the 0.509 prior run** — by 4.6 SE (n=1000,
+SE ≈ 0.016) — and it beats the fixed baseline by 0.15, three times the ~0.05 run-to-run
+noise floor. Even its pessimistic deterministic-inference number (0.511) edges past the old
+stochastic 0.509. It closes roughly **40%** of the gap between the fixed GPT baseline and
+the MLP.
+
+**The win came from deleting one line.** §8.4 removed `torch.floor` from
+`compute_sequence_lengths_differentiable`; that was the only reason
+`--sequence_length_weight` could affect training at all. The diagnosis in §8.3 predicted
+the fix — the actor almost never asks for a long plan — and the fix delivered.
+
+**B2 (0.479) is unproven**: above the 0.432 baseline, but inside the noise band.
+
+Caveats: A3 is one run at one seed, and it ran 500k steps against the baseline's 1M (best
+val arrived at 265k, so it was not cut short). Still well below the MLP's 0.794.
+
+### 9.6 Logging fixes
+
+**The final test metrics never reached wandb.** `eval_with_pretrained_model` logs them with
+`c_writer.add_scalar(tag, value)` and no step, so tensorboard records them at step 0 — but
+by then the run's counter is at `total_timesteps`, and `sync_tensorboard` requires
+non-decreasing steps, so they were dropped. The headline numbers existed only in the slurm
+logs, which is why every result in §8–§9 was recovered by grepping. They are now mirrored
+into `wandb.run.summary`, which is step-independent and surfaces as columns
+(`test-eval-with-critic/mean_episodic_success` and the `-deterministic` variant).
+
+**A correct actor-embedding metric.** The logged `mean cosine similarity all pairs` reduces
+`dim=2` of a `(batch, n_heads, embedding_dim)` tensor — the **head** axis, not the embedding
+axis. At `n_heads=1` the vectors have length 1 and cosine degenerates to sign agreement; at
+`n_heads=5` it measures something else entirely, which is why A2 reported 0.952 against a
+1-head baseline of 0.619. The original is kept unchanged so the §8.6 trajectory stays
+readable in its own units, and **`actor/embedding_cosine`** is added alongside: pairwise
+cosine between per-state head-0 embeddings, reduced over the embedding axis, self-pairs
+excluded. That matches what `check_z_influence.py` reports (0.7783 on `earthy-bird-16`) and
+is comparable across head counts.
+
+### 9.7 Wave D — three experiments against A3
+
+A3 is now the control: it is the best configuration, so improvements stack on it rather
+than on a baseline already beaten. Each run changes exactly one thing.
+
+| | config | question |
+|---|---|---|
+| `sbatch/d1_a3_repeat.sbatch` | A3 unchanged | Is 0.582 real? `--no-torch_deterministic` makes this an independent sample without a seed change. |
+| `sbatch/d2_a3_soft_feedback.sbatch` | A3 + `--decoder_soft_token_feedback` | Does soft feedback pay off once plans are long enough to have a chain worth differentiating? B2 alone was noise, but on length-1 plans (`mean_len = 1.01`) there is barely a chain for it to act on. |
+| `sbatch/d3_a3_actor_lr.sbatch` | A3 + `--actor_learning_rate 3e-4` | Cheapest test of the weak-gradient theory: the actor's gradient norm was 0.197–0.265 vs the MLP's 0.387. If the signal is simply ~2x too small, this compensates. |
+
+Read against A3's 0.582 with a 0.05 noise floor, so a real win clears ~0.63. Watch
+`actor/embedding_cosine` as well as the score — movement there is the mechanism signal,
+independent of success rate.
+
+**Parked, with reasons:**
+
+- **Multi-head** — genuinely untested rather than refuted (§9.1). Worth one retry now that
+  `--min_qf_value` exists, but after wave D.
+- **`z` at every position** — would strengthen conditioning, but §8.3 Part A already shows
+  the decoder responds well to `z` (44 unique sequences from 256 random `z`, better than
+  untrained). It reinforces something that works.
+- **`--include_actor_embedding_in_critic_input`** (direct `dQ/dz`) — needs two fixes first:
+  four call sites unpack 5 values from `DenseVAE.forward`, which returns 4; and those calls
+  encode sub-sequences with the VAE encoder, which receives no gradient in from-scratch E2E
+  runs, so the stored `z` would be noise from a random encoder. It also carries a design
+  risk: with `z` in the critic's input the actor can raise Q by moving `z` without the
+  decoded sequence improving.
+- **Reconstruction pretraining** — the highest-ceiling option and §6.5's own recommendation:
+  it attacks the real difficulty, a from-scratch autoregressive model learning sequence
+  structure from sparse reward, and would train the encoder the item above needs. Blocked on
+  the §4.1–4.3 standalone-loop fixes.
