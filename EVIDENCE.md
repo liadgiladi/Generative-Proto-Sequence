@@ -13,14 +13,17 @@ Task: `16x16_corridors_v1`, from-scratch end-to-end RL (`--train_decoder_end_to_
 
 ## 1. Where things stand
 
-| config | test success (stochastic) | deterministic | hours | steps |
-|---|---|---|---|---|
-| **MLP decoder (the target)** | **0.794** | — | 10.4 | 1M |
-| prior GPT run, pre-fixes | 0.509 | — | 50.3 | 1M |
-| GPT baseline, post-fixes (det) | 0.432 | 0.329 | 11.29 | 1M |
-| GPT baseline, post-fixes (non-det) | 0.403 | 0.318 | 7.62 | 1M |
-| **GPT + length penalty (A3)** ← best | **0.582** | 0.511 | 4.26 | 500k |
-| GPT + soft token feedback (B2) | 0.479 | 0.400 | 5.50 | 500k |
+| config | test success | seeds | note |
+|---|---|---|---|
+| **MLP decoder (the target)** | **0.794** | 1 | 10.4h, 1M steps |
+| prior GPT run, pre-fixes | 0.509 | 1 | 50.3h |
+| GPT baseline, post-fixes | 0.418 | 0.432, 0.403 | 1M steps |
+| GPT + soft feedback alone (B2) | 0.480 | 0.479, 0.481 | worse than A3 |
+| **GPT + length penalty (A3)** | **0.619** | 0.582, 0.611, 0.665 | 500k, ~4.3h |
+| **A3 + soft feedback (D2)** ← best | **0.691** | 1 seed | needs confirming (D5) |
+| A3 + actor lr 3e-4 (D3) | 0.445 | 1 seed | **refuted** — see §3 |
+
+Runs are 500k steps unless noted; validation peaks ~265k–355k so 500k loses nothing.
 
 **Runtime is solved**: 50.3h → 4–11h on the same GPU class. Do not spend more effort there
 without a reason; see §7.2/§7.4 of the integration doc for what was already measured and
@@ -36,9 +39,10 @@ Best-known config (`sbatch/a3_length.sbatch`): 1 proto-plan candidate,
 
 ## 2. Rules that cost us runs to learn
 
-1. **Noise floor is ~0.05.** Two runs of the same config gave 0.432 and 0.488. At n=1000
-   test episodes SE ≈ 0.016, but run-to-run variance dominates. **Anything under 0.05 is
-   not a result.** A3's +0.15 is 3× that, which is why it is believed.
+1. **Noise floor is ~0.042 (1σ).** Three A3 seeds gave 0.582 / 0.611 / 0.665. At n=1000
+   test episodes SE ≈ 0.016, but run-to-run variance dominates it, so **a 2σ result needs
+   ~+0.084**. A3's +0.20 over baseline clears that easily; D2's +0.072 over A3 is ~1.7σ and
+   is *not* yet established.
 2. **Two seeds per config.** Almost every number in the integration doc is single-seed.
    `--no-torch_deterministic` makes a re-run an independent sample without changing `--seed`.
 3. **One variable per run**, and **build on the current best**, not on a baseline already
@@ -63,6 +67,7 @@ Each of these cost real time. Check them before trusting a measurement.
 | trap | what happens |
 |---|---|
 | **`mean cosine similarity all pairs`** (logged) | Reduces the **head** axis of a `(batch, n_heads, embed)` tensor, not the embedding axis. At 1 head it degenerates to sign agreement; at 5 heads it measures something else. **Only comparable between runs with the same head count.** Use **`actor/embedding_cosine`** (added later) or `check_z_influence.py`. |
+| **`actor/embedding_cosine`** — even the correct one | A **mechanism signal, not a performance proxy.** D2 and D3 both roughly halved it (0.337 / 0.375 vs a 0.641 control) and scored 0.691 and **0.445** — opposite directions. Forcing actor diversity can cost you 0.17. Never judge a config on this alone. |
 | **`max_qf_value`** | Dead config unless `min_qf_value` is also set — the clip is gated on it being non-`None`. It was never active in *any* run in this repo, including the 0.794 MLP baseline. |
 | **`--sequence_length_weight` / `--invalid_actions_weight`** | Were no-ops: `compute_sequence_lengths_differentiable` ended in `torch.floor`, which has zero gradient, so the penalties were logged and could not influence training. **Fixed** — and removing that one line is what produced A3's +0.15. |
 | **wandb TEST columns showing `-`** | The final test metrics log under `test-eval-with-critic/*`; the columns usually displayed are the **periodic** `test-eval-with-critic-<step>/*`, which our configs disable via `--eval_test_dataset_during_training_freq -1`. Also, before the fix, final metrics were written with no step and dropped entirely. Runs before that fix have empty columns — their numbers are in the slurm logs. |

@@ -814,6 +814,60 @@ One reason that is not a formality: §6.5 records the MLP baseline at ~1.6 valid
 sequence, and A3 is already at 2.53. Longer is not obviously monotonically better — there
 may be an optimum nearby or already passed.
 
+### 9.9 Wave D results
+
+| config | seeds | mean |
+|---|---|---|
+| baseline | 0.432, 0.403 | 0.418 |
+| B2 — soft feedback **alone** | 0.479, 0.481 | 0.480 |
+| **A3 — length penalty** | 0.582, 0.611, 0.665 | **0.619** |
+| **D2 — A3 + soft feedback** | **0.691** | — (1 seed) |
+| D3 — A3 + actor lr 3e-4 | 0.445 | — (1 seed) |
+| *MLP baseline* | *0.794* | — |
+
+**The noise floor is ~0.042, not 0.03.** Three A3 seeds (0.582 / 0.611 / 0.665) give a
+sample std of 0.042, so a 2σ result needs roughly **+0.084** over the 0.619 mean. The
+earlier 0.03 figure came from a deterministic/non-deterministic pair, which differ in more
+than seed.
+
+#### D3 is refuted, and it invalidates the metric we were tracking
+
+`actor/embedding_cosine` over matched sample indices (every 5000 steps):
+
+| sample (≈steps) | 5 (25k) | 10 (50k) | 17 (85k) | 25 (125k) | 35 (175k) | 44 (220k) |
+|---|---|---|---|---|---|---|
+| D1 (A3 control) | 0.687 | 0.743 | 0.701 | 0.656 | 0.623 | 0.641 |
+| D2 (soft feedback) | 0.794 | 0.762 | 0.629 | 0.421 | 0.363 | **0.337** |
+| D3 (actor lr) | 0.825 | 0.782 | 0.555 | 0.373 | 0.339 | **0.375** |
+
+D1 is flat — the actor barely learns, exactly the §8.3 collapse, and consistent with A3
+leaving it untouched (0.778 → 0.789 in §9.8). D2 and D3 both diverge from the control
+around 50–85k steps and end at roughly **half** its value. The first interventions to move
+the actor at all.
+
+**And they went in opposite directions on success: 0.691 vs 0.445.**
+
+So **`actor/embedding_cosine` is a mechanism signal, not a performance proxy.** You can
+halve it and lose 0.17. D3 — simply taking larger actor steps — achieves the diversity and
+damages the agent. Actor collapse is real and diagnosable, but *forcing* diversity is not
+the fix, and any future experiment judged on that metric alone will mislead.
+
+#### D2 composes with A3, which is the result worth chasing
+
+- soft feedback **alone** (B2, 2 seeds): 0.480 — *worse* than A3
+- soft feedback **on top of A3** (D2, 1 seed): 0.691 — best so far
+
+That is precisely what D2 was built to test. Gradient flowing through the decode chain has
+almost nothing to work with when plans are length 1 (`mean_len = 1.01` on the baseline);
+A3 is what makes them long. The two mechanisms appear to compose rather than overlap.
+
+**Not yet established**: +0.072 over the A3 mean is ~1.7σ, and it sits only 0.026 above
+A3's best seed. `sbatch/d5_d2_repeat.sbatch` is the second seed that decides it.
+
+- **≥ 0.66 again** → A3 + soft feedback becomes the baseline at ~0.68; the gap to the MLP's
+  0.794 narrows to ~0.11.
+- **~0.62** → D2 was a draw from the top of the A3 distribution and the lever is spent.
+
 Read against A3's 0.582 with a 0.05 noise floor, so a real win clears ~0.63. Watch
 `actor/embedding_cosine` as well as the score — movement there is the mechanism signal,
 independent of success rate.
