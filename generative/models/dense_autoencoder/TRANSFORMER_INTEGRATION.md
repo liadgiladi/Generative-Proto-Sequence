@@ -1,5 +1,10 @@
 # Transformer Decoder Integration
 
+> **Picking up this work?** Start with [`EVIDENCE.md`](../../../EVIDENCE.md) at the
+> repository root — current results, methodology, and the metrics and flags that silently
+> lie or do nothing. This file is the full chronological record; `EVIDENCE.md` is the
+> orientation layer.
+
 Replacing the VAE's single-shot MLP decoder with a minimal, latent-conditioned causal
 Transformer (minGPT-style) and migrating the surrounding mechanics from a flattened
 one-hot representation to integer-token autoregressive modeling.
