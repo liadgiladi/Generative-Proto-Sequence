@@ -778,6 +778,41 @@ than on a baseline already beaten. Each run changes exactly one thing.
 | `sbatch/d1_a3_repeat.sbatch` | A3 unchanged | Is 0.582 real? `--no-torch_deterministic` makes this an independent sample without a seed change. |
 | `sbatch/d2_a3_soft_feedback.sbatch` | A3 + `--decoder_soft_token_feedback` | Does soft feedback pay off once plans are long enough to have a chain worth differentiating? B2 alone was noise, but on length-1 plans (`mean_len = 1.01`) there is barely a chain for it to act on. |
 | `sbatch/d3_a3_actor_lr.sbatch` | A3 + `--actor_learning_rate 3e-4` | Cheapest test of the weak-gradient theory: the actor's gradient norm was 0.197–0.265 vs the MLP's 0.387. If the signal is simply ~2x too small, this compensates. |
+| `sbatch/d4_a3_stronger_length.sbatch` | A3 + `--sequence_length_weight 2e-3` (4×) | §9.8 shows the penalty is under-powered — `mean_len` settled at 2.53 against a band asking for ≥4. Does pushing further keep paying? |
+
+### 9.8 How A3 actually won — and what it did *not* fix
+
+`check_z_influence.py` on A3's checkpoint (`kind-bush-24`) against the baseline
+(`earthy-bird-16`), 256 samples each:
+
+| | baseline (0.432) | **A3 (0.582)** | change |
+|---|---|---|---|
+| **mean_len from actor `z`** | 1.01 | **2.53** | **+150%** |
+| **unique plans from actor `z`** | 5/256 | **17/256** | **3.4×** |
+| actor embedding cosine | 0.7783 | 0.7892 | unchanged |
+| decoder on *random* `z` (unique / mean_len) | 44 / 1.77 | 47 / 1.99 | barely moved |
+| `invalid - empty action sequence` | 12 | 3 | fewer |
+
+**The penalty did what it was designed to do, and the score tracks the mechanism** — plans
+more than doubled in length and 3.4× more distinct plans reach execution.
+
+**But the actor did not become more state-dependent.** Cosine moved 0.778 → 0.789, i.e.
+nowhere. Note the asymmetry between the two halves of the measurement: Part A (random `z`)
+barely moved while Part B (actor `z`) moved a lot. Training only reshapes the region the
+actor actually visits. So A3's win came from **the decoder learning to spread the actor's
+narrow `z`-region across longer, more varied plans** — not from repairing the actor.
+
+**The §8.3 actor collapse is therefore still fully intact**, and every actor-targeted lever
+(diversity, learning rate, soft feedback) remains genuinely unexplored in terms of moving
+that number. D2 and D3 are the first tests of it.
+
+**And the penalty is under-powered.** `mean_len` equilibrated at 2.53 against a band asking
+for ≥ 4 — the Q term pushes back and the balance settled below target. D4 raises the weight
+4× to find out whether the lever has more to give.
+
+One reason that is not a formality: §6.5 records the MLP baseline at ~1.6 valid actions per
+sequence, and A3 is already at 2.53. Longer is not obviously monotonically better — there
+may be an optimum nearby or already passed.
 
 Read against A3's 0.582 with a 0.05 noise floor, so a real win clears ~0.63. Watch
 `actor/embedding_cosine` as well as the score — movement there is the mechanism signal,

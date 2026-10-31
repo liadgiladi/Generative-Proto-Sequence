@@ -107,6 +107,25 @@ Two candidate causes, still not fully separated:
 whether (b) only pays off once (a) is fixed — soft feedback has little chain to act on when
 plans are length 1.
 
+### What A3 changed, measured
+
+Same diagnostic on A3's checkpoint (`kind-bush-24`, 0.582) vs the baseline above:
+
+| | baseline (0.432) | A3 (0.582) |
+|---|---|---|
+| mean_len from actor `z` | 1.01 | **2.53** |
+| unique plans from actor `z` | 5/256 | **17/256** |
+| actor embedding cosine | 0.7783 | 0.7892 (unchanged) |
+| decoder on *random* `z` | 44 / 1.77 | 47 / 1.99 (barely moved) |
+
+**A3 did not fix the actor.** It made the decoder spread the actor's still-narrow
+`z`-region across longer, more varied plans. Note Part A barely moved while Part B moved a
+lot — training only reshapes the region the actor visits. So the actor collapse in §4 above
+is still intact, and every actor-targeted lever remains untested.
+
+`mean_len` also settled at 2.53 against a band asking for ≥ 4, so the penalty is
+under-powered — D4 tests a 4× weight.
+
 ---
 
 ## 5. Tooling
