@@ -1112,21 +1112,48 @@ def eval_test_dataset(test_dataset: list[tuple[PositionXY, PositionXY, int]],
             for idx, agent_step_ratio in enumerate(episodic_avg_agent_step_ratio_in_sequences):
                 c_writer.add_scalar(f"{c_tag_name}/episodic_agent_step_ratio", agent_step_ratio, idx)
 
-        c_writer.add_scalar(f"{c_tag_name}/mean_episodic_return", np.round(np.mean(episodic_returns), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_episodic_success", np.round(np.mean(episodic_successes), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_decoder_generations", np.round(np.mean(episodic_num_decoder_generations), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_valid_actions_per_sequence_in_episode", np.round(np.mean(episodic_avg_valid_actions_in_sequences), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_unused_actions_per_sequence_in_episode", np.round(np.mean(episodic_avg_unused_actions_in_sequences), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_agent_step_ratio_per_sequence_in_episode", np.round(np.mean(episodic_avg_agent_step_ratio_in_sequences), 3))
-        
-        # Add timing statistics to logs (successful episodes only)
-        c_writer.add_scalar(f"{c_tag_name}/avg_wall_clock_time_per_optimal_step", timing_stats['avg_wall_clock_time_per_optimal_step'])
-        c_writer.add_scalar(f"{c_tag_name}/std_wall_clock_time_per_optimal_step", timing_stats['std_wall_clock_time_per_optimal_step'])
-        c_writer.add_scalar(f"{c_tag_name}/avg_inference_time_per_decision_successful", timing_stats['avg_inference_time_per_decision_successful'])
-        c_writer.add_scalar(f"{c_tag_name}/std_inference_time_per_decision_successful", timing_stats['std_inference_time_per_decision_successful'])
-        c_writer.add_scalar(f"{c_tag_name}/total_episodes", timing_stats['total_episodes'])
-        c_writer.add_scalar(f"{c_tag_name}/successful_episodes", timing_stats['successful_episodes'])
-        c_writer.add_scalar(f"{c_tag_name}/total_decisions_successful", timing_stats['total_decisions_successful'])
+        test_metrics = {
+            f"{c_tag_name}/mean_episodic_return": np.round(np.mean(episodic_returns), 3),
+            f"{c_tag_name}/mean_episodic_success": np.round(np.mean(episodic_successes), 3),
+            f"{c_tag_name}/mean_num_decoder_generations": np.round(np.mean(episodic_num_decoder_generations), 3),
+            f"{c_tag_name}/mean_num_valid_actions_per_sequence_in_episode": np.round(np.mean(episodic_avg_valid_actions_in_sequences), 3),
+            f"{c_tag_name}/mean_num_unused_actions_per_sequence_in_episode": np.round(np.mean(episodic_avg_unused_actions_in_sequences), 3),
+            f"{c_tag_name}/mean_agent_step_ratio_per_sequence_in_episode": np.round(np.mean(episodic_avg_agent_step_ratio_in_sequences), 3),
+            # Timing statistics (successful episodes only)
+            f"{c_tag_name}/avg_wall_clock_time_per_optimal_step": timing_stats['avg_wall_clock_time_per_optimal_step'],
+            f"{c_tag_name}/std_wall_clock_time_per_optimal_step": timing_stats['std_wall_clock_time_per_optimal_step'],
+            f"{c_tag_name}/avg_inference_time_per_decision_successful": timing_stats['avg_inference_time_per_decision_successful'],
+            f"{c_tag_name}/std_inference_time_per_decision_successful": timing_stats['std_inference_time_per_decision_successful'],
+            f"{c_tag_name}/total_episodes": timing_stats['total_episodes'],
+            f"{c_tag_name}/successful_episodes": timing_stats['successful_episodes'],
+            f"{c_tag_name}/total_decisions_successful": timing_stats['total_decisions_successful'],
+        }
+
+        for metric_name, metric_value in test_metrics.items():
+            c_writer.add_scalar(metric_name, metric_value)
+
+        # Mirror the same numbers into wandb's run summary.
+        #
+        # The add_scalar calls above pass no step, so tensorboard records them at step 0 --
+        # but by the time the final test evaluation runs, the run's step counter is at
+        # total_timesteps. wandb requires non-decreasing steps when syncing tensorboard, so
+        # these land behind the run and never appear as columns: the headline test numbers
+        # were only ever readable by grepping the slurm log.
+        #
+        # Summary values carry no step, so they surface directly in the runs table. Keys
+        # are identical to the tensorboard tags, e.g.
+        #   test-eval-with-critic/mean_episodic_success
+        #   test-eval-with-critic-deterministic/mean_episodic_success
+        if c_cfg.track:
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.run.summary.update(
+                        {k: float(v) for k, v in test_metrics.items()}
+                    )
+            except Exception as exc:  # pragma: no cover - logging must not break evaluation
+                print(f"[GPS] (wandb summary update skipped: {exc})", flush=True)
 
         if len(all_env_eval_stats) > 0:
             writer.add_scalar(
