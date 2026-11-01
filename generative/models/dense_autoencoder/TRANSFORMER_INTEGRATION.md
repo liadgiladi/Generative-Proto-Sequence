@@ -861,12 +861,59 @@ That is precisely what D2 was built to test. Gradient flowing through the decode
 almost nothing to work with when plans are length 1 (`mean_len = 1.01` on the baseline);
 A3 is what makes them long. The two mechanisms appear to compose rather than overlap.
 
-**Not yet established**: +0.072 over the A3 mean is ~1.7σ, and it sits only 0.026 above
-A3's best seed. `sbatch/d5_d2_repeat.sbatch` is the second seed that decides it.
+**Confirmed by D5** (second seed): 0.691 and 0.675, mean **0.683**, spread 0.016. Welch's t
+against A3's three seeds gives t ≈ 2.5 — a real gain of +0.064.
 
-- **≥ 0.66 again** → A3 + soft feedback becomes the baseline at ~0.68; the gap to the MLP's
-  0.794 narrows to ~0.11.
-- **~0.62** → D2 was a draw from the top of the A3 distribution and the lever is spent.
+### 9.10 Final wave D results — the length weight is the dominant lever
+
+| config | seeds | mean | vs previous |
+|---|---|---|---|
+| baseline | 0.432, 0.403 | 0.418 | — |
+| B2 — soft feedback **alone** | 0.479, 0.481 | 0.480 | worse than A3 |
+| A3 — length 5e-4 | 0.582, 0.611, 0.665 | 0.619 | +0.20 over baseline |
+| D2 — A3 + soft feedback | 0.691, 0.675 | 0.683 | +0.064 |
+| **D4/D6 — length 2e-3** | **0.741, 0.709** | **0.725** | **+0.106 over A3** |
+| D7 — length 2e-3 + soft feedback | 0.734 | — | +0.009 — **noise** |
+| D8 — length 4e-3 | 0.742 | — | +0.017 — **noise** |
+| *MLP target* | *0.794* | *(1 seed)* | |
+
+Noise floor **0.042 (1σ)**, from A3's three seeds.
+
+**The length penalty is the dominant lever, and it has plateaued.** The weight sweep reads
+5e-4 → 0.619, 2e-3 → 0.725, 4e-3 → 0.742; the last step is inside the noise. D4 at 2e-3 is
+the operating point.
+
+**Soft feedback and the length penalty overlap — they do not compose.** Its contribution
+shrank as the penalty strengthened:
+
+- on A3 (5e-4): 0.619 → 0.683, **+0.064**
+- on D4 (2e-3): 0.725 → 0.734, **+0.009**
+
+Which is what the mechanism predicts. Soft feedback lets gradient flow through the decode
+chain, and that is worth something when plans are long enough to have a chain worth
+differentiating — but worthless once a stronger penalty has already forced them long. Two
+routes to the same improvement, not two independent ones. Only testing the combination
+revealed it; assuming additivity would have predicted ~0.805.
+
+**Status: ~0.725–0.742 against the MLP's 0.794** — a gap of ~0.06, about 1.5σ, and the MLP
+is a single seed. The configurations are no longer clearly distinguishable.
+
+**The cheap levers are exhausted.** D7 and D8 both demonstrate that more knob-turning will
+not close the remainder. The one substantial untried option is **reconstruction
+pretraining** (§6.5): the decoder has never been shown an action sequence, having been
+asked to learn sequence structure from sparse RL reward alone — which is the hardest
+possible way to train a sequence model and throws away the Transformer's actual advantage.
+Blocked on the §4.1–4.3 standalone-loop fixes.
+
+**Best-known configuration** (`sbatch/d6_d4_repeat.sbatch`):
+
+```
+--n_proto_plan_candidates 1 --min_qf_value -20.0 --max_qf_value 1.0
+--sequence_length_weight 0.002 --min_lengths_per_head 4 --max_lengths_per_head 10
+--total_timesteps 500000 --no-torch_deterministic --decoder_use_cuda_graph
+```
+
+~4.3 h on a `gtx_1080`, against the 50.3 h / 0.509 run this investigation started from.
 
 Read against A3's 0.582 with a 0.05 noise floor, so a real win clears ~0.63. Watch
 `actor/embedding_cosine` as well as the score — movement there is the mechanism signal,

@@ -18,12 +18,28 @@ Task: `16x16_corridors_v1`, from-scratch end-to-end RL (`--train_decoder_end_to_
 | **MLP decoder (the target)** | **0.794** | 1 | 10.4h, 1M steps |
 | prior GPT run, pre-fixes | 0.509 | 1 | 50.3h |
 | GPT baseline, post-fixes | 0.418 | 0.432, 0.403 | 1M steps |
-| GPT + soft feedback alone (B2) | 0.480 | 0.479, 0.481 | worse than A3 |
-| **GPT + length penalty (A3)** | **0.619** | 0.582, 0.611, 0.665 | 500k, ~4.3h |
-| **A3 + soft feedback (D2)** ← best | **0.691** | 1 seed | needs confirming (D5) |
-| A3 + actor lr 3e-4 (D3) | 0.445 | 1 seed | **refuted** — see §3 |
+| soft feedback alone (B2) | 0.480 | 0.479, 0.481 | worse than A3 |
+| length 5e-4 (A3) | 0.619 | 0.582, 0.611, 0.665 | |
+| A3 + soft feedback (D2) | 0.683 | 0.691, 0.675 | real gain, +0.064 |
+| A3 + actor lr 3e-4 (D3) | 0.445 | 1 | **refuted** — see §3 |
+| **length 2e-3 (D4/D6)** ← **best** | **0.725** | 0.741, 0.709 | 500k, ~4.3h |
+| length 2e-3 + soft feedback (D7) | 0.734 | 1 | +0.009 — noise |
+| length 4e-3 (D8) | 0.742 | 1 | +0.017 — noise |
 
 Runs are 500k steps unless noted; validation peaks ~265k–355k so 500k loses nothing.
+
+**Best-known config** (`sbatch/d6_d4_repeat.sbatch`): 1 candidate,
+`--sequence_length_weight 0.002`, bands 4–10, `--min_qf_value -20.0`, 500k steps,
+`--no-torch_deterministic`, `--decoder_use_cuda_graph`.
+
+**The length penalty is the dominant lever and it has plateaued** (5e-4 → 0.619,
+2e-3 → 0.725, 4e-3 → 0.742; the last step is inside the noise). **Soft feedback overlaps
+with it rather than composing**: worth +0.064 on top of A3, only +0.009 on top of D4 —
+both are routes to exploiting longer plans, so once the penalty forces them long, the
+gradient fix adds nothing. Assuming additivity would have predicted 0.805.
+
+**Gap to the MLP is now ~0.06 (~1.5σ) on a single MLP seed** — the configurations are no
+longer clearly distinguishable. The cheap levers are exhausted; see §6 for what remains.
 
 **Runtime is solved**: 50.3h → 4–11h on the same GPU class. Do not spend more effort there
 without a reason; see §7.2/§7.4 of the integration doc for what was already measured and
@@ -161,10 +177,14 @@ test evaluations are logging only.
   encode sub-sequences with the VAE **encoder**, which gets no gradient in from-scratch E2E
   runs, so the stored `z` would be noise. Also a design risk: with `z` in the critic's
   input, the actor can raise Q by moving `z` without the decoded sequence improving.
-- **Reconstruction pretraining** — highest ceiling, and §6.5's own recommendation. Attacks
-  the real difficulty (a from-scratch autoregressive model learning sequence structure from
-  sparse reward) and would train the encoder the item above needs. Blocked on the §4.1–4.3
-  standalone-loop fixes.
+- **Reconstruction pretraining** — **the only substantial lever left.** The decoder has
+  never been shown an action sequence; it has been asked to learn sequence structure from
+  sparse RL reward alone, which is the hardest possible way to train a sequence model and
+  discards the Transformer's actual advantage. Would also train the encoder the item above
+  needs. Blocked on the §4.1–4.3 standalone-loop fixes (~a day's work).
+- **More knob-turning on length / soft feedback** — finished, and D7/D8 are the proof.
+  Stacking soft feedback on the best config gained +0.009; doubling the length weight
+  gained +0.017. Both inside the 0.042 noise floor. Do not re-sweep these.
 - **Runtime work** — done. `torch.compile` fails on sm_61 (Triton needs ≥7.0); CPU decoding
   is worse; shrinking the model gains ~1.6% because the cost is dispatch, not arithmetic.
 
