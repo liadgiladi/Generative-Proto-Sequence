@@ -43,13 +43,30 @@ deterministic, matching the MLP's settings): **0.706 test, 11.98h, best validati
 200,000.** Same as the 500k runs, so 500k was never a handicap and every comparison above
 stands.
 
-Best config across three runs: **0.741, 0.709, 0.706 → mean 0.719, sd 0.019.**
+**Headline: 0.726 ± 0.018** — the strong-length-penalty family, five runs:
 
-**Gap to the MLP: 0.075 (~3.9σ at that variance) — probably real.** An earlier note in this
-file called it "~1.5σ, not clearly distinguishable"; that used A3's looser spread (0.042).
-With three seeds of the best config the variance is tighter and the gap does not look like
-noise. The one caveat is that the MLP is a **single seed** with no variance estimate of its
-own.
+| run | config | test |
+|---|---|---|
+| D4 | length 2e-3 | 0.741 |
+| D6 | length 2e-3 | 0.709 |
+| P1 | length 2e-3, 1M steps, deterministic | 0.706 |
+| D7 | length 2e-3 + soft feedback | 0.734 |
+| D8 | length 4e-3 | 0.742 |
+
+Pooling is justified because **no variant is distinguishable from another** (D7 +0.009 and
+D8 +0.017 against the 2e-3 runs, both inside the noise), so these are five samples of one
+effect rather than five different results. Restricting to the three repeated 2e-3 seeds
+gives 0.719 ± 0.019 — the same picture, less data.
+
+Note **0.74 was reached twice independently** (D4 at 0.741, D8 at 0.742), so the top of the
+range is not a single lucky draw. Still, quote the **mean, not the maximum**: picking 0.742
+because it is the largest cell is selecting on noise, especially against a baseline that is
+itself a single seed.
+
+**Gap to the MLP: 0.068** (0.794 − 0.726), ≈3.8σ at sd 0.018 — it does not look like noise.
+An earlier note in this file called it "~1.5σ, not clearly distinguishable"; that used A3's
+looser spread (0.042). The one caveat is that the MLP is a **single seed** with no variance
+estimate of its own, so 0.794 could itself be a high draw.
 
 **Runtime: parity, not a win.** 50.3h → 11.98h deterministic at 1M steps, against the MLP's
 10:24:26 — and ours skipped the periodic test evaluations the baseline paid for (~1.3h), so
