@@ -38,27 +38,35 @@ with it rather than composing**: worth +0.064 on top of A3, only +0.009 on top o
 both are routes to exploiting longer plans, so once the penalty forces them long, the
 gradient fix adds nothing. Assuming additivity would have predicted 0.805.
 
-**Gap to the MLP is now ~0.06 (~1.5σ) on a single MLP seed** — the configurations are no
-longer clearly distinguishable. The cheap levers are exhausted; see §6 for what remains.
+**P1 — the 1M-step run at the baseline's own step count** (`sbatch/p1_full_1m.sbatch`,
+deterministic, matching the MLP's settings): **0.706 test, 11.98h, best validation at step
+200,000.** Same as the 500k runs, so 500k was never a handicap and every comparison above
+stands.
 
-**Runtime is solved**: 50.3h → 4–11h on the same GPU class. Do not spend more effort there
-without a reason; see §7.2/§7.4 of the integration doc for what was already measured and
-ruled out.
+Best config across three runs: **0.741, 0.709, 0.706 → mean 0.719, sd 0.019.**
 
-**Accuracy is the open problem.** A3 closes ~40% of the baseline→MLP gap. It is **one seed**.
+**Gap to the MLP: 0.075 (~3.9σ at that variance) — probably real.** An earlier note in this
+file called it "~1.5σ, not clearly distinguishable"; that used A3's looser spread (0.042).
+With three seeds of the best config the variance is tighter and the gap does not look like
+noise. The one caveat is that the MLP is a **single seed** with no variance estimate of its
+own.
 
-Best-known config (`sbatch/a3_length.sbatch`): 1 proto-plan candidate,
-`--sequence_length_weight 5e-4` with bands `4`–`10`, `--min_qf_value -20.0`, 500k steps,
-`--no-torch_deterministic`, `--decoder_use_cuda_graph`.
+**Runtime: parity, not a win.** 50.3h → 11.98h deterministic at 1M steps, against the MLP's
+10:24:26 — and ours skipped the periodic test evaluations the baseline paid for (~1.3h), so
+at matched logging it is ~28% slower. The 4× improvement over where this started is real;
+"faster than the MLP" is not.
+
+**The open problem is the stall — see §4.**
 
 ---
 
 ## 2. Rules that cost us runs to learn
 
-1. **Noise floor is ~0.042 (1σ).** Three A3 seeds gave 0.582 / 0.611 / 0.665. At n=1000
-   test episodes SE ≈ 0.016, but run-to-run variance dominates it, so **a 2σ result needs
-   ~+0.084**. A3's +0.20 over baseline clears that easily; D2's +0.072 over A3 is ~1.7σ and
-   is *not* yet established.
+1. **Noise floor is 0.019–0.042 (1σ), config-dependent.** Three A3 seeds gave
+   0.582 / 0.611 / 0.665 (sd 0.042); three of the best config gave 0.741 / 0.709 / 0.706
+   (sd 0.019). At n=1000 test episodes SE ≈ 0.016, so run-to-run variance dominates. **Use
+   the looser figure when judging a new config** (a 2σ result needs ~+0.084) and the tighter
+   one only when you have seeds of that exact config.
 2. **Two seeds per config.** Almost every number in the integration doc is single-seed.
    `--no-torch_deterministic` makes a re-run an independent sample without changing `--seed`.
 3. **One variable per run**, and **build on the current best**, not on a baseline already
@@ -66,9 +74,10 @@ Best-known config (`sbatch/a3_length.sbatch`): 1 proto-plan candidate,
 4. **Judge mechanism, not just score.** A change can be right and still land inside the
    noise. Track `actor/embedding_cosine` and plan length alongside success — a config that
    moves the mechanism but not the score has still taught you something.
-5. **500k steps is enough.** Validation peaks around 265k–355k and declines. Check
-   `best val mean global step`: near 500k means the run was cut short and deserves 1M; near
-   300k means the extra steps buy nothing.
+5. **500k steps is enough — verified.** Validation peaks at 200k–355k and then declines;
+   P1 ran the full 1M and scored 0.706, the same as the 500k runs. Check
+   `best val mean global step` anyway: near the end of the run means it was cut short.
+   (The MLP baseline is the exception — its best was at step 999,999, still climbing.)
 6. **Pin the GPU type.** `--gpus=gtx_1080:1`, never a bare `--gpus=1` — the partition has
    `gtx_1080`, `rtx_2080` and `rtx_3090`, and one experiment silently landed on different
    silicon. (GPU model barely affects *speed* here — the workload is CPU-side dispatch
@@ -128,6 +137,48 @@ Two candidate causes, still not fully separated:
 whether (b) only pays off once (a) is fixed — soft feedback has little chain to act on when
 plans are length 1.
 
+### The stall — the open problem
+
+From `best val mean global step`:
+
+| | best validation at step | still improving at 1M? |
+|---|---|---|
+| **MLP (0.794)** | **999,999** | **yes — 0.794 is a lower bound** |
+| **Transformer (0.706 at 1M)** | **200,000** | no — plateaus, then declines |
+
+And at **matched steps** the MLP is also ahead: **0.77 val at ~215k vs 0.72 at 200k.**
+
+So this is **not** a sample-efficiency trade. The MLP dominates at every point *and* keeps
+climbing; the Transformer simply stops after 200k. Any claim that the Transformer learns
+faster is wrong — an earlier version of this file said so before the matched-step numbers
+came in.
+
+"Learns fast, then stalls" is the signature of a **capacity ceiling**, not a bad optimiser.
+And there is a specific suspect: §6.3 shrank the decoder from `n_layer=3, n_embd=64`
+(152,512 params) to `n_layer=2, n_embd=32` (26,688) **to save runtime** — and §7.2 later
+measured the decoder as ~100% dispatch overhead, where `embd 32→16` is 3.5× fewer params
+and 1.6% faster. **The shrink bought almost nothing and was decided before that was known.**
+
+`sbatch/f1_capacity_restore.sbatch` restores the original size. **Result: _(pending)_**
+
+Read the **stall step**, not only the score:
+
+- best-val step **moves past 200k** → capacity was binding; sweep further (`n_layer 4`,
+  `n_embd 128`) before anything else
+- still **~200k at ~0.72** → capacity is not it; look at the length-penalty schedule
+  (it contributes ~71% of the Q term at 2e-3 and keeps pushing after plans are long enough),
+  critic saturation, or overfitting to the 100 training pairs
+- **worse** → the larger decoder is harder to optimise from sparse reward, which is what
+  §6.3 originally argued, and the question closes
+
+Two free checks on `p1`'s log that narrow it further, not yet done:
+
+```bash
+L=$(ls sbatch/logs/p1_full_1m-*.out)
+grep "losses/critic_values" "$L" | awk 'NR%20==0' | tail -10          # pinned near 1.0 = critic stops discriminating
+grep "val dataset with critic mean success" "$L" | awk 'NR%20==0' | tail -10   # plateau vs decline
+```
+
 ### What A3 changed, measured
 
 Same diagnostic on A3's checkpoint (`kind-bush-24`, 0.582) vs the baseline above:
@@ -156,8 +207,10 @@ under-powered — D4 tests a 4× weight.
 | `check_z_influence.py` | Actor collapse vs decoder collapse, offline from checkpoints. The diagnostic that produced §4 above. |
 | `eval_checkpoint.py` / `sbatch/eval_checkpoint.sbatch` | Test-set evaluation against saved checkpoints — recovers numbers from runs that died before their own final eval. Minutes, not hours. |
 | `bench_decoder.py` / `sbatch/e0_bench_decoder.sbatch` | Per-call decoder cost: MLP vs GPT vs CUDA-graph vs CPU. |
-| `sbatch/e1`–`e8` | The runtime matrix (eval cost, determinism cost, CUDA-graph win). Settled; see §7.2. |
-| `sbatch/a1`–`a3`, `b2`, `d1`–`d3` | Accuracy experiments. `a1`/`a2` are stale 5-candidate versions without `--min_qf_value`. |
+| `sbatch/e0`–`e8` | The runtime matrix (eval cost, determinism cost, CUDA-graph win). Settled; see §7.2. |
+| `sbatch/a1`–`a3`, `b2`, `d1`–`d8` | Accuracy experiments. `a1`/`a2` are stale 5-candidate versions without `--min_qf_value`. `d6` is the best-known config. |
+| `sbatch/p1_full_1m.sbatch` | The headline run: best config at the baseline's 1M steps, deterministic, matched settings. |
+| `sbatch/f1_capacity_restore.sbatch` | **In flight.** Restores the pre-§6.3 decoder size (`n_layer 3`, `n_embd 64`) to test whether the 200k stall is a self-imposed capacity ceiling. |
 
 Checkpoints live in `runs/<wandb-run-name>/{actor,critic,decoder}`, written whenever
 validation success improves. **Only the validation evaluation ever saves**; the train and
@@ -187,13 +240,28 @@ test evaluations are logging only.
   gained +0.017. Both inside the 0.042 noise floor. Do not re-sweep these.
 - **Runtime work** — done. `torch.compile` fails on sm_61 (Triton needs ≥7.0); CPU decoding
   is worse; shrinking the model gains ~1.6% because the cost is dispatch, not arithmetic.
+  *(That last measurement is why `f1_capacity_restore` is worth running: the §6.3 shrink
+  traded capacity for a speedup that does not exist.)*
+
+### Next, in order
+
+1. **`f1_capacity_restore` — in flight.** Record its result in §4 under "The stall". Judge
+   the **best-val step** first, the score second.
+2. If capacity moves the stall → sweep further (`n_layer 4`, `n_embd 128`). Nearly free at
+   runtime for the same reason.
+3. If it does not → run the two free `p1` log checks in §4 to separate critic saturation
+   from a length-penalty that keeps pushing after it has done its job. A decaying
+   `sequence_length_weight` would test the latter.
+4. Only then **reconstruction pretraining**, which is a day of work on the §4.1–4.3
+   standalone loop before a single run.
 
 ---
 
 ## 7. Running and reading
 
 ```bash
-sbatch sbatch/d1_a3_repeat.sbatch          # ~4.5h
+sbatch sbatch/d6_d4_repeat.sbatch                     # best-known config, ~4.5h
+sbatch sbatch/p1_full_1m.sbatch                       # 1M steps, deterministic, ~12h
 sbatch sbatch/eval_checkpoint.sbatch runs/<run-dir>   # recover a dead run's test numbers
 ```
 
