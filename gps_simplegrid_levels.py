@@ -235,6 +235,15 @@ class Config:
     """whether to use batch normalization in the actor's linear layers"""
     actor_weight_decay: float = 1e-4
     """the weight decay for the actor's network"""
+    actor_grad_clip: float = 0.0
+    """if > 0, clip the global gradient norm of the actor (and, in end-to-end mode, the
+       decoder) to this value before stepping. Off by default. Typical actor gradient norms
+       are 0.2-0.4, so a clip around 1.0 only bites on spikes. Motivated by two runs that
+       destabilised the *actor* specifically: a larger decoder (n_layer 3 / n_embd 64)
+       NaN'd at step 159k with the NaN appearing in cnn.0.weight, and actor_learning_rate
+       3e-4 scored 0.445. Both amplify what reaches the actor. Note this is preventive, not
+       curative: clipping cannot repair a gradient that is already NaN, it only limits the
+       growth that leads there"""
     pe_embedding_dim: int = 128
     """the embedding dimension of the position encoding for concatenation with the CNN output in the actor network. Set to -1 to disable position encoding."""
     exclude_decoder_from_computation_graph: bool = False
@@ -2204,6 +2213,15 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                     if cfg.train_decoder_end_to_end:
                         decoder_optimizer.zero_grad()
                     actor_loss.backward()
+
+                    # Clip before the gradient-monitoring block below, so the norms it logs
+                    # are the ones actually applied.
+                    if cfg.actor_grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(actor_network.parameters(),
+                                                       cfg.actor_grad_clip)
+                        if cfg.train_decoder_end_to_end:
+                            torch.nn.utils.clip_grad_norm_(decoder.model.parameters(),
+                                                           cfg.actor_grad_clip)
 
                     # Gradient monitoring
                     if global_step > 10 and global_step % 250 == 0:
