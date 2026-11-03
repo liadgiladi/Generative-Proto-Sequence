@@ -117,6 +117,7 @@ Each of these cost real time. Check them before trusting a measurement.
 | **`--diversity_weight`** | Compares *pairs of actor heads*. At `n_proto_plan_candidates=1` there are no pairs and the term is identically zero. Needs >1 head to do anything. |
 | **`--sequence_length_weight` + head count** | Asserts `len(min_lengths_per_head) == n_proto_plan_candidates`. The 5-element defaults crash at 1 candidate — pass single-element bands. |
 | **`n_proto_plan_candidates > 1`** | The Bellman target takes `argmax` over candidates — maximisation bias, a no-op at 1 candidate. At 5 it diverged: peak at step 60k, then 250k steps of decay, then NaN. Needs `--min_qf_value` before retrying. |
+| **`--actor_grad_clip`** | Applies to **both** the actor and the decoder. Their gradient norms differ by an order of magnitude — actor 0.2–0.4, decoder 2–16 — so a value that merely guards the actor throttles the decoder 2–16× every step. F2 died at step 61.5k where the unclipped F1 reached 159k. Clip the actor only, or add a separate decoder value. |
 | **`handle_nan_weights`** | Dead code that rebinds `param.data`. If ever wired up it silently invalidates every captured CUDA graph. |
 | **`torch_deterministic`** | Costs 1.71× runtime — via cuBLAS (`CUBLAS_WORKSPACE_CONFIG`), not the convolutions (`conv2d` is 1.2% of the loop). |
 | **wandb SDK** | 0.16.4 cannot authenticate against the current backend (`CommError: 'NoneType' object has no attribute 'get'`), and its interactive `wandb login` rejects modern 86-char `wandb_v1_` keys with a 40-char check. Upgrade the SDK; write `~/.netrc` directly if the prompt refuses the key. Never commit the key — one was auto-revoked for exactly that. |
@@ -176,7 +177,36 @@ And there is a specific suspect: §6.3 shrank the decoder from `n_layer=3, n_emb
 measured the decoder as ~100% dispatch overhead, where `embd 32→16` is 3.5× fewer params
 and 1.6% faster. **The shrink bought almost nothing and was decided before that was known.**
 
-`sbatch/f1_capacity_restore.sbatch` restores the original size. **Result: _(pending)_**
+#### Capacity: two runs, two different failures — **unresolved, not refuted**
+
+| run | config | outcome |
+|---|---|---|
+| **F1** | `n_layer 3, n_embd 64` | NaN at step **159,000** in the *actor* (`cnn.0.weight`); test 0.657 |
+| **F2** | F1 + `--actor_grad_clip 1.0` | NaN at step **61,500**, same layer; test 0.391 |
+
+Neither number is a capacity result — both are best-checkpoint scores from runs that died
+before their peak (the 2e-3 family peaks around 200k).
+
+**F1 was on the same trajectory when it died**, which is the important part:
+
+| | best val | at step |
+|---|---|---|
+| P1 (`n_layer 2, n_embd 32`) | 0.64 | 140,000 |
+| F1 (`n_layer 3, n_embd 64`) | **0.65** | 150,000 |
+
+P1 went on to peak at 0.72 around 200k; F1 never got there. So "bigger is worse" is **not**
+what was observed — the larger decoder was marginally ahead and then destabilised.
+
+**F2's clip was misconfigured, and that is the lesson.** A single value was applied to both
+networks, but their gradient scales differ by an order of magnitude: the actor runs 0.2–0.4
+(so 1.0 barely bites) while the decoder runs 2–16. Clipping both at 1.0 cut the decoder
+2–16× on every step — an effective learning-rate collapse, not a safety net. The actor then
+absorbed more of the adaptation and failed *sooner*. Any retry must clip the actor only, or
+use separate values.
+
+**Verdict: dropped, not because capacity was refuted but because the expected value is low.**
+F1 was ahead by 0.01 at matched steps, so even a clean win looks like +0.02–0.05, inside the
+noise band. Two runs spent; a third is poor value at ~0.74.
 
 Read the **stall step**, not only the score:
 
@@ -227,7 +257,10 @@ under-powered — D4 tests a 4× weight.
 | `sbatch/e0`–`e8` | The runtime matrix (eval cost, determinism cost, CUDA-graph win). Settled; see §7.2. |
 | `sbatch/a1`–`a3`, `b2`, `d1`–`d8` | Accuracy experiments. `a1`/`a2` are stale 5-candidate versions without `--min_qf_value`. `d6` is the best-known config. |
 | `sbatch/p1_full_1m.sbatch` | The headline run: best config at the baseline's 1M steps, deterministic, matched settings. |
-| `sbatch/f1_capacity_restore.sbatch` | **In flight.** Restores the pre-§6.3 decoder size (`n_layer 3`, `n_embd 64`) to test whether the 200k stall is a self-imposed capacity ceiling. |
+| `sbatch/f1_capacity_restore.sbatch`, `f2_capacity_clipped.sbatch` | Decoder capacity. Both NaN'd in the actor before reaching their peak — see §4. Dropped. |
+| `sbatch/g1`–`g2_train_data_*.sbatch` | 300 / 500 training pairs, against the 0.17 train-val gap at the peak. |
+| `sbatch/g3_d8_repeat.sbatch` | Second seed of length 4e-3 — decides whether the reportable figure is 0.726 or ~0.74. |
+| `sbatch/g4_multihead_clipped.sbatch` | Multi-head retry with Q clipping and actor clipping, the guards A1–A3 lacked. |
 
 Checkpoints live in `runs/<wandb-run-name>/{actor,critic,decoder}`, written whenever
 validation success improves. **Only the validation evaluation ever saves**; the train and
