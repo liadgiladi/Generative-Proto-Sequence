@@ -8,7 +8,11 @@ Transformer tree and the paper's MLP tree -- but scattered across lines, and onl
 Transformer tree pushes any of them to wandb.
 
     poetry run python compare_runs.py sbatch/logs/i2_*.out sbatch/logs/i3_*.out
-    poetry run python compare_runs.py --csv results.csv sbatch/logs/*.out
+    poetry run python compare_runs.py --csv all_maps.csv sbatch/logs/j1_*.out sbatch/logs/j2_*.out
+
+Columns are labelled from the "=== J1: map=... ===" header the j-series scripts echo, since
+they are parameterised by map and every one of them writes to the same j1_gpt_map-<jobid>.out
+filename. Logs without that header fall back to their filename.
 
 Works on logs from either tree, since both print the same lines.
 """
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import sys
 
@@ -38,6 +43,14 @@ TIMING = re.compile(
     r"std inference time per decision \(successful episodes only\)"
     r"): (?P<value>-?[\d.e+]+) seconds$",
     re.MULTILINE,
+)
+
+# "=== J1: map=16x16_empty  length_weight=0.002  train_pairs=500 ==="
+# The j-series scripts are parameterised by map, so every one of them writes to
+# j1_gpt_map-<jobid>.out and the filename alone cannot tell two maps apart. Prefer the
+# header the script echoes.
+HEADER = re.compile(
+    r"^=== (?P<arm>J\d): map=(?P<map>\S+)(?:\s+length_weight=(?P<weight>\S+))?", re.MULTILINE
 )
 
 SIMPLE = {
@@ -87,6 +100,16 @@ def parse(path: str) -> dict:
 
     out: dict[str, str] = {}
 
+    header = HEADER.search(text)
+    if header:
+        # Strip the shared "16x16_" prefix so columns stay narrow; the arm (J1 = GPT,
+        # J2 = MLP) matters more than the resolution, which is in the map name anyway.
+        name = header.group("map").replace("16x16_", "").replace("_v1", "")
+        arm = "gpt" if header.group("arm") == "J1" else "mlp"
+        if header.group("weight") == "0":
+            arm += "/plain"       # the no-length-penalty arm, comparable to the MLP's
+        out["_label"] = f"{name}:{arm}"
+
     for match in TEST_METRIC.finditer(text):
         suffix = " (det)" if match.group("det") else ""
         out[match.group("metric").strip() + suffix] = match.group("value")
@@ -122,8 +145,15 @@ def main() -> None:
                         help="include the deterministic-inference pass as well")
     args = parser.parse_args()
 
-    runs = [(path.rsplit("/", 1)[-1].rsplit("-", 1)[0], parse(path)) for path in args.logs]
-    runs = [(name, data) for name, data in runs if "_error" not in data]
+    runs = []
+    for path in args.logs:
+        data = parse(path)
+        if "_error" in data:
+            continue
+        # The map/arm label the script echoed, when there is one -- j1_gpt_map-*.out is
+        # the same filename for every map in the sweep.
+        fallback = os.path.basename(path).rsplit("-", 1)[0]
+        runs.append((data.pop("_label", None) or fallback, data))
     if not runs:
         sys.exit("no readable logs")
 

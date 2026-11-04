@@ -7,11 +7,55 @@ earned themselves through failed runs. Full technical detail is in
 
 Branch: `transformer-integration` (PR #2 against `liadgiladi:main`, draft).
 Task: `16x16_corridors_v1`, from-scratch end-to-end RL (`--train_decoder_end_to_end
---no-initialize_decoder_from_pretrained`).
+--no-initialize_decoder_from_pretrained`). Multi-environment sweep in flight — §1.3.
 
 ---
 
 ## 1. Where things stand
+
+### 1.1 The headline — the gap was the dataset, not the architecture
+
+Everything in §1.4 below was measured at **100 training pairs**, the paper's protocol. At
+that size both decoders are data-starved and the comparison measures starvation. Raising
+the training set closes the gap completely:
+
+| training pairs | GPT (tuned) | MLP | gap |
+|---|---|---|---|
+| 100 | 0.725 ± 0.018 (n=5) | 0.794 | −0.069 |
+| 300 | 0.897 (g1) | *h2 in flight* | ? |
+| **500** | **0.990** (g2) | **0.982** (h1) | **+0.008 — tied** |
+
+So **the deficit was never architectural.** Every symptom diagnosed in §4 — the actor
+collapse, the length-1 plans, the 200k stall, the 0.17 train/val gap — is a symptom of
+overfitting 100 pairs, and all of them dissolve at 500. Do not spend another run on
+capacity, heads, or optimiser tuning aimed at that 0.069.
+
+### 1.2 The real result — sequence-level efficiency at tied success
+
+g2 vs h1, both 500 pairs, both at the success ceiling. This is what GPS actually claims,
+and it is invisible in accuracy alone:
+
+| metric | GPT | MLP | |
+|---|---|---|---|
+| success | 0.990 | 0.982 | tied |
+| **decoder generations/ep** | **3.36** | 13.34 | **4.0× fewer decisions** |
+| **agent step ratio** | **0.936** | 0.573 | **near-optimal paths** |
+| actions/ep | 10.1 | 25.1 | 2.5× shorter episodes |
+| valid actions/seq | 3.01 | 2.06 | longer usable plans |
+| revisits (global) | 0.12 | 1.94 | **16× less wandering** |
+| wall-clock / optimal step | **0.0041s** | 0.0102s | 2.5× cheaper per unit progress |
+| inference / decision | 0.0029s | 0.0025s | per-call cost ≈ equal |
+
+Note the last two rows together: a single decode is *slightly more expensive* for the
+Transformer, and it still wins 2.5× on wall-clock per optimal step, because it needs 4×
+fewer of them. **That is the sequence-level argument, measured.**
+
+### 1.3 Multi-environment sweep — in flight
+
+Launched at 500 pairs across the six remaining maps (`j1_gpt_map` / `j2_mlp_map`); corridors
+is done and is the table above. Results and the standing question go in **§8**.
+
+### 1.4 The 100-pair study (superseded, kept for the mechanism it established)
 
 | config | test success | seeds | note |
 |---|---|---|---|
@@ -68,12 +112,18 @@ An earlier note in this file called it "~1.5σ, not clearly distinguishable"; th
 looser spread (0.042). The one caveat is that the MLP is a **single seed** with no variance
 estimate of its own, so 0.794 could itself be a high draw.
 
+> **Superseded by §1.1.** The gap is real at 100 pairs and gone at 500. It measured which
+> decoder degrades more gracefully under data starvation, not which decoder is better.
+
 **Runtime: parity, not a win.** 50.3h → 11.98h deterministic at 1M steps, against the MLP's
 10:24:26 — and ours skipped the periodic test evaluations the baseline paid for (~1.3h), so
 at matched logging it is ~28% slower. The 4× improvement over where this started is real;
 "faster than the MLP" is not.
 
-**The open problem is the stall — see §4.**
+**The stall (§4) was also a 100-pair artifact** — it is overfitting a tiny training set, not
+a capacity ceiling. §4 is kept because its *mechanism* findings (decoder healthy, actor
+collapsed, what the length penalty actually changes) still hold and still inform
+`check_z_influence.py` readings.
 
 ---
 
@@ -95,7 +145,16 @@ at matched logging it is ~28% slower. The 4× improvement over where this starte
    P1 ran the full 1M and scored 0.706, the same as the 500k runs. Check
    `best val mean global step` anyway: near the end of the run means it was cut short.
    (The MLP baseline is the exception — its best was at step 999,999, still climbing.)
-6. **Pin the GPU type.** `--gpus=gtx_1080:1`, never a bare `--gpus=1` — the partition has
+6. **Check the data regime before blaming the model.** `--train_dataset_size 100` is a
+   starvation regime, and starvation looks exactly like a capacity ceiling: fast early
+   learning, a hard plateau, a wide train/val gap. We spent wave D, F and most of §4 inside
+   it. **Run one 500-pair control before any architectural hypothesis** — it is the same
+   cost as the experiment and it decides whether the experiment is worth running at all.
+7. **Success rate saturates; report the sequence-level metrics too.** At 500 pairs both
+   decoders sit at ~0.99 and accuracy can no longer separate them — the separation is 4×
+   in decisions per episode and 1.6× in path optimality (§1.2). Run `compare_runs.py`, not
+   `grep mean success`.
+8. **Pin the GPU type.** `--gpus=gtx_1080:1`, never a bare `--gpus=1` — the partition has
    `gtx_1080`, `rtx_2080` and `rtx_3090`, and one experiment silently landed on different
    silicon. (GPU model barely affects *speed* here — the workload is CPU-side dispatch
    bound, 7% between a 1080 Ti and a 2080 Ti — but it affects comparability.)
@@ -120,6 +179,8 @@ Each of these cost real time. Check them before trusting a measurement.
 | **`--actor_grad_clip`** | Applies to **both** the actor and the decoder. Their gradient norms differ by an order of magnitude — actor 0.2–0.4, decoder 2–16 — so a value that merely guards the actor throttles the decoder 2–16× every step. F2 died at step 61.5k where the unclipped F1 reached 159k. Clip the actor only, or add a separate decoder value. |
 | **`handle_nan_weights`** | Dead code that rebinds `param.data`. If ever wired up it silently invalidates every captured CUDA graph. |
 | **`torch_deterministic`** | Costs 1.71× runtime — via cuBLAS (`CUBLAS_WORKSPACE_CONFIG`), not the convolutions (`conv2d` is 1.2% of the loop). |
+| **The MLP baseline tree is unpatched** | `~/gps-mlp-baseline` sits at 6f627a2, the paper's code drop, and **predates every §7–§9 fix**: accumulating decoder gradient, inference-time dropout, `torch.floor`. Deliberate — it is the published method as published — but **state the asymmetry when reporting**. The dropout one does not apply (the MLP has no dropout layers); the gradient one does. |
+| **`--train_dataset_size` default (100)** | Not a neutral setting. See rule 6 — it is a starvation regime that mimics a capacity ceiling. Both `j1`/`j2` now default to 500; the paper's protocol is the third/second positional argument. |
 | **wandb SDK** | 0.16.4 cannot authenticate against the current backend (`CommError: 'NoneType' object has no attribute 'get'`), and its interactive `wandb login` rejects modern 86-char `wandb_v1_` keys with a 40-char check. Upgrade the SDK; write `~/.netrc` directly if the prompt refuses the key. Never commit the key — one was auto-revoked for exactly that. |
 
 ---
@@ -258,9 +319,13 @@ under-powered — D4 tests a 4× weight.
 | `sbatch/a1`–`a3`, `b2`, `d1`–`d8` | Accuracy experiments. `a1`/`a2` are stale 5-candidate versions without `--min_qf_value`. `d6` is the best-known config. |
 | `sbatch/p1_full_1m.sbatch` | The headline run: best config at the baseline's 1M steps, deterministic, matched settings. |
 | `sbatch/f1_capacity_restore.sbatch`, `f2_capacity_clipped.sbatch` | Decoder capacity. Both NaN'd in the actor before reaching their peak — see §4. Dropped. |
-| `sbatch/g1`–`g2_train_data_*.sbatch` | 300 / 500 training pairs, against the 0.17 train-val gap at the peak. |
+| `compare_runs.py` | **The reporting tool.** Parses both trees' logs for the full GPS metric set — decoder generations, agent step ratio, valid/unused actions, revisits, timing — and prints them side by side. `--csv` to write. Flags runs that died before their final eval rather than presenting partial numbers as comparable. |
+| `sbatch/g1`–`g2_train_data_*.sbatch` | 300 / 500 training pairs. **The experiment that resolved the whole investigation** — see §1.1. |
 | `sbatch/g3_d8_repeat.sbatch` | Second seed of length 4e-3 — decides whether the reportable figure is 0.726 or ~0.74. |
 | `sbatch/g4_multihead_clipped.sbatch` | Multi-head retry with Q clipping and actor clipping, the guards A1–A3 lacked. |
+| `sbatch/h1`/`h2_mlp_*pairs.sbatch` | The MLP at 500 / 300 pairs — the matched-data baseline for g2 / g1. |
+| `sbatch/i1`–`i3_empty_*.sbatch` | `16x16_empty` at 100 pairs. Superseded by the `j`-series at 500; run them only for a paper-protocol comparison. |
+| **`sbatch/j1_gpt_map.sbatch`**, **`j2_mlp_map.sbatch`** | **Parameterised by map** — the multi-environment sweep (§8). `j1 <map> [length_weight] [pairs]`, `j2 <map> [pairs]`; both default to 500 pairs. `j1 <map> 0` is the no-length-penalty arm. |
 
 Checkpoints live in `runs/<wandb-run-name>/{actor,critic,decoder}`, written whenever
 validation success improves. **Only the validation evaluation ever saves**; the train and
@@ -295,30 +360,41 @@ test evaluations are logging only.
 
 ### Next, in order
 
-1. **`f1_capacity_restore` — in flight.** Record its result in §4 under "The stall". Judge
-   the **best-val step** first, the score second.
-2. If capacity moves the stall → sweep further (`n_layer 4`, `n_embd 128`). Nearly free at
-   runtime for the same reason.
-3. If it does not → run the two free `p1` log checks in §4 to separate critic saturation
-   from a length-penalty that keeps pushing after it has done its job. A decaying
-   `sequence_length_weight` would test the latter.
-4. Only then **reconstruction pretraining**, which is a day of work on the §4.1–4.3
-   standalone loop before a single run.
+1. **The multi-environment sweep — in flight.** Fill in §8 as logs land. This is now the
+   main line of work; everything below waits on it.
+2. **Second seed on two or three maps**, once the sweep shows where the effect is largest.
+   The sequence-level metrics have no measured noise floor yet — §1.2 is n=1 per arm, and
+   a 4× ratio is almost certainly real while a 1.2× one is not.
+3. **Reconstruction pretraining** — still the only substantial untried lever, and now a
+   better bet than when it was parked: at 500 pairs the decoder is no longer starved, so
+   a pretrained one has something to improve *on* rather than a collapsed actor to fight.
+   A day of work on the §4.1–4.3 standalone loop before a single run.
+
+**Do not** re-open capacity, multi-head, or length/soft-feedback tuning. All three were
+aimed at a 0.069 gap that no longer exists.
 
 ---
 
 ## 7. Running and reading
 
 ```bash
-sbatch sbatch/d6_d4_repeat.sbatch                     # best-known config, ~4.5h
-sbatch sbatch/p1_full_1m.sbatch                       # 1M steps, deterministic, ~12h
+sbatch sbatch/j1_gpt_map.sbatch 16x16_empty           # Transformer on any map, 500 pairs
+sbatch sbatch/j2_mlp_map.sbatch 16x16_empty           # the MLP baseline for it
+sbatch sbatch/d6_d4_repeat.sbatch                     # best-known config, corridors, ~4.5h
 sbatch sbatch/eval_checkpoint.sbatch runs/<run-dir>   # recover a dead run's test numbers
 ```
 
+**Reading results — use `compare_runs.py`, not grep.** Success rate alone is saturated at
+500 pairs and will tell you the two decoders are identical (§1.2):
+
 ```bash
-# results from a finished run
+poetry run python compare_runs.py --csv all_maps.csv sbatch/logs/j1_*.out sbatch/logs/j2_*.out
+grep "=== J1:" sbatch/logs/j1_*.out        # which map each log ran -- not in the filename
+```
+
+```bash
+# single-run spot checks
 grep -E "^test dataset with critic.* mean success" <log>
-grep "best val mean success" <log> | tail -1
 grep "best val mean global step" <log> | tail -1   # ~500k means it was cut short
 grep "actor embedding cosine" <log> | head -2      # mechanism signal: early vs late
 grep "actor embedding cosine" <log> | tail -2
@@ -330,3 +406,61 @@ populated automatically for runs after the §9.6 fix.
 A NaN no longer destroys a run's result: the gradient-monitoring abort and `select_action`
 both degrade gracefully so the final test evaluation still runs against the best saved
 checkpoint.
+
+---
+
+## 8. Multi-environment sweep — 500 pairs, GPT vs MLP
+
+The paper evaluates 9 environments; **this repo ships 7** (both 24x24 obstacle maps are
+absent). Corridors is done; the other six are in flight as of 2026-11-04.
+
+```bash
+MAPS="8x8_empty 16x16_empty 16x16_room_v1 16x16_obstacles_v1_15p 16x16_obstacles_v1_25p 24x24_empty"
+for m in $MAPS; do
+  sbatch sbatch/j1_gpt_map.sbatch "$m"
+  sbatch sbatch/j2_mlp_map.sbatch "$m"
+done
+```
+
+Fill in from `compare_runs.py`. Success is expected to be ~tied everywhere — **the
+discriminating columns are decisions/ep and step ratio**:
+
+| map | GPT succ | MLP succ | GPT gen/ep | MLP gen/ep | GPT ratio | MLP ratio |
+|---|---|---|---|---|---|---|
+| 16x16_corridors_v1 | 0.990 | 0.982 | **3.36** | 13.34 | **0.936** | 0.573 |
+| 8x8_empty | | | | | | |
+| 16x16_empty | | | | | | |
+| 16x16_room_v1 | | | | | | |
+| 16x16_obstacles_v1_15p | | | | | | |
+| 16x16_obstacles_v1_25p | | | | | | |
+| 24x24_empty | | | | | | |
+
+### The three questions this answers
+
+- **Does the advantage scale with horizon?** 8x8 is short-horizon, 24x24 longest. If the
+  4× decision reduction shrinks on 8x8 and grows on 24x24, the claim sharpens from "the
+  Transformer is better" to "the advantage is horizon-dependent" — stronger, because it
+  names a mechanism and predicts where it fails.
+- **Does path optimality survive clutter?** 15p → 25p obstacles. The 0.936 step ratio was
+  measured on corridors, which reward committing to long straight runs. If it holds under
+  clutter the result generalises; if the MLP catches up, it was corridor-specific.
+- **Is anything clipped by the plan-length ceiling?** See the caveat below.
+
+### Caveat — read before trusting 24x24 or 8x8
+
+`max_level` defaults to 14 and `n_actions_in_seq` to 10, both chosen for 16x16. On 24x24
+optimal paths are longer, so a 10-action plan covers proportionally less ground; on 8x8 the
+level range may clip. **The tell is `valid actions/seq` pinned near 10 with
+`decoder generations/ep` jumping** — that means plan length is the binding constraint, the
+measured advantage is a *lower bound*, and the number is not comparable across maps.
+
+### Known asymmetries, to state when reporting
+
+1. **500 pairs, not the paper's 100.** Deliberate (§1.1) — at 100 the comparison measures
+   starvation. Any direct comparison to the paper's published numbers must use 100.
+2. **The MLP tree is unpatched** — accumulating decoder gradient, see §3.
+3. **1M steps for the MLP, 500k for the GPT.** Not an oversight: the MLP's best validation
+   landed at step 999,999 on corridors (still climbing) while the Transformer peaks around
+   200k. Equal step counts would handicap the MLP; this gives each its own best case.
+4. **n=1 per cell.** No noise floor on the sequence-level metrics yet. A 4× ratio is safe
+   to quote; anything under ~1.5× is not.
