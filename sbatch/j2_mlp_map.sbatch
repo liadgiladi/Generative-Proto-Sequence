@@ -38,6 +38,7 @@ source activate gps_env
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 MAP="$1"
+TRAIN_PAIRS="${2:-500}"
 WORKTREE="${HOME}/gps-mlp-baseline"
 
 if [ -z "${MAP}" ]; then
@@ -61,7 +62,7 @@ if grep -q "mingpt_decoder" "${WORKTREE}/generative/models/dense_autoencoder/den
 fi
 
 cd "${WORKTREE}" || exit 1
-echo "=== J2: map=${MAP}  from $(pwd) at $(git rev-parse --short HEAD) ==="
+echo "=== J2: map=${MAP}  train_pairs=${TRAIN_PAIRS}  from $(pwd) at $(git rev-parse --short HEAD) ==="
 
 START=$(date +%s)
 
@@ -69,7 +70,7 @@ poetry run python gps_simplegrid_levels.py \
     --cuda \
     --track \
     --obstacle_map "${MAP}" \
-    --train_dataset_size 100 \
+    --train_dataset_size "${TRAIN_PAIRS}" \
     --train_eval_dataset_size 100 \
     --val_dataset_size 100 \
     --test_dataset_size 1000 \

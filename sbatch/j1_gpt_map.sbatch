@@ -44,11 +44,18 @@ source activate gps_env
 
 MAP="$1"
 LENGTH_WEIGHT="${2:-0.002}"
+# 500 pairs, not the paper's 100. At 100 both decoders are data-starved (0.725 vs 0.794 on
+# corridors) and the comparison measures starvation; at 500 both sit at the success ceiling
+# (0.99 vs 0.982) and the difference is purely sequence-level efficiency -- 3.36 vs 13.34
+# decoder generations per episode, 0.936 vs 0.573 agent step ratio. That is the paper's
+# actual claim, and it only becomes visible once accuracy saturates.
+TRAIN_PAIRS="${3:-500}"
 
 if [ -z "${MAP}" ]; then
     echo "ERROR: pass the obstacle map, e.g."
     echo "  sbatch $0 16x16_obstacles_v1_25p"
-    echo "  sbatch $0 16x16_obstacles_v1_25p 0     # no length penalty"
+    echo "  sbatch $0 16x16_obstacles_v1_25p 0        # no length penalty"
+    echo "  sbatch $0 16x16_obstacles_v1_25p 0.002 100  # paper's 100-pair protocol"
     exit 1
 fi
 
@@ -60,7 +67,7 @@ if [ "${LENGTH_WEIGHT}" != "0" ]; then
                  --min_lengths_per_head 4 --max_lengths_per_head 10)
 fi
 
-echo "=== J1: map=${MAP}  sequence_length_weight=${LENGTH_WEIGHT} ==="
+echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS} ==="
 
 START=$(date +%s)
 
@@ -69,7 +76,7 @@ poetry run python gps_simplegrid_levels.py \
     --track \
     --no-torch_deterministic \
     --obstacle_map "${MAP}" \
-    --train_dataset_size 100 \
+    --train_dataset_size "${TRAIN_PAIRS}" \
     --train_eval_dataset_size 100 \
     --val_dataset_size 100 \
     --test_dataset_size 1000 \
