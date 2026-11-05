@@ -181,6 +181,9 @@ Each of these cost real time. Check them before trusting a measurement.
 | **`torch_deterministic`** | Costs 1.71× runtime — via cuBLAS (`CUBLAS_WORKSPACE_CONFIG`), not the convolutions (`conv2d` is 1.2% of the loop). |
 | **The MLP baseline tree is unpatched** | `~/gps-mlp-baseline` sits at 6f627a2, the paper's code drop, and **predates every §7–§9 fix**: accumulating decoder gradient, inference-time dropout, `torch.floor`. Deliberate — it is the published method as published — but **state the asymmetry when reporting**. The dropout one does not apply (the MLP has no dropout layers); the gradient one does. |
 | **`--train_dataset_size` default (100)** | Not a neutral setting. See rule 6 — it is a starvation regime that mimics a capacity ceiling. Both `j1`/`j2` now default to 500; the paper's protocol is the third/second positional argument. |
+| **`--train_dataset_size` is not comparable across maps** | It is an absolute count, drawn from pools that differ by 35×. At levels 1–14, 500 pairs is **24.8%** of 8x8_empty's train pool, **2.0%** of 16x16_empty's, **0.7%** of 24x24_empty's. Comparing success across maps at a fixed count conflates map difficulty with data coverage. Quote coverage, or set the size per map. |
+| **`max_level` (default 14) caps the horizon on every map** | The dataset only ever contains start/goal pairs with optimal path ≤ 14 — so **no map tests long horizons**, whatever its size. 8x8's diameter is 14 (levels 1–14 = 100% of the map), 16x16's is 30 (76% of pairs usable), 24x24's is 46 (46%). **24x24 is short paths on a large canvas, not a longer horizon.** Any horizon-scaling claim needs `max_level` raised with the map, which also changes the pool and the data regime. |
+| **1.0 success on 8x8** | Not leakage — the splits are disjoint (`simplegrid_dataset.py` partitions each level into `[:train]`, `[train:train+eval]`, `[train+eval:]`). It is saturation: a trivial empty grid with a quarter of its pairs in the training set. **8x8 success carries no information**; read the sequence-level metrics or drop the row. |
 | **wandb SDK** | 0.16.4 cannot authenticate against the current backend (`CommError: 'NoneType' object has no attribute 'get'`), and its interactive `wandb login` rejects modern 86-char `wandb_v1_` keys with a 40-char check. Upgrade the SDK; write `~/.netrc` directly if the prompt refuses the key. Never commit the key — one was auto-revoked for exactly that. |
 
 ---
@@ -437,22 +440,37 @@ discriminating columns are decisions/ep and step ratio**:
 
 ### The three questions this answers
 
-- **Does the advantage scale with horizon?** 8x8 is short-horizon, 24x24 longest. If the
-  4× decision reduction shrinks on 8x8 and grows on 24x24, the claim sharpens from "the
-  Transformer is better" to "the advantage is horizon-dependent" — stronger, because it
-  names a mechanism and predicts where it fails.
+- **~~Does the advantage scale with horizon?~~** Not answerable here — `max_level 14` fixes
+  the horizon on every map. See the caveat below. What the map size *does* vary is the
+  observation and the data coverage, so a trend across sizes is a coverage trend.
 - **Does path optimality survive clutter?** 15p → 25p obstacles. The 0.936 step ratio was
   measured on corridors, which reward committing to long straight runs. If it holds under
   clutter the result generalises; if the MLP catches up, it was corridor-specific.
 - **Is anything clipped by the plan-length ceiling?** See the caveat below.
 
-### Caveat — read before trusting 24x24 or 8x8
+### Caveat — the sweep cannot answer the horizon question
 
-`max_level` defaults to 14 and `n_actions_in_seq` to 10, both chosen for 16x16. On 24x24
-optimal paths are longer, so a 10-action plan covers proportionally less ground; on 8x8 the
-level range may clip. **The tell is `valid actions/seq` pinned near 10 with
-`decoder generations/ep` jumping** — that means plan length is the binding constraint, the
-measured advantage is a *lower bound*, and the number is not comparable across maps.
+`max_level` defaults to 14, so **every map is capped at 14-step optimal paths**. Map size
+changes the observation and how much of the space 500 pairs covers; it does **not** change
+the horizon. An earlier version of this section claimed 24x24 was the long-horizon case and
+told readers to watch for the `n_actions_in_seq=10` ceiling there — wrong. That ceiling
+(two generations minimum for a 14-step path) binds equally on every map.
+
+Coverage at levels 1–14, which is what actually varies:
+
+| map | usable pairs | 500 train pairs | diameter |
+|---|---|---|---|
+| 8x8_empty | 4,032 (100% of the map) | **24.8%** of the pool | 14 |
+| 16x16_empty | 49,840 (76%) | 2.0% | 30 |
+| 24x24_empty | 151,760 (46%) | 0.7% | 46 |
+
+So **8x8 is saturated by construction** — a quarter of every pair that exists, on a trivial
+grid. Expect 1.0 from both decoders and read only the sequence-level columns there. At the
+other end, 24x24 at 0.7% is closer to the starvation regime of §1.1 than to corridors' 500.
+
+A genuine horizon-scaling experiment needs `max_level` raised with the map (e.g. 14 / 30 /
+46), which changes the pool size too and so needs the data regime re-fixed per map. That is
+a different sweep, not a re-read of this one.
 
 ### Known asymmetries, to state when reporting
 
