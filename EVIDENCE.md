@@ -19,16 +19,24 @@ Everything in §1.4 below was measured at **100 training pairs**, the paper's pr
 that size both decoders are data-starved and the comparison measures starvation. Raising
 the training set closes the gap completely:
 
-| training pairs | GPT (tuned) | MLP | gap |
-|---|---|---|---|
-| 100 | 0.725 ± 0.018 (n=5) | 0.794 | −0.069 |
-| 300 | 0.897 (g1) | *h2 in flight* | ? |
-| **500** | **0.990** (g2) | **0.982** (h1) | **+0.008 — tied** |
+| training pairs | coverage | GPT (tuned) | MLP | gap |
+|---|---|---|---|---|
+| 100 | 5.6% | 0.725 ± 0.018 (n=5) | 0.794 | −0.069 |
+| 300 | 16.9% | 0.897 (g1) | *h2 in flight* | ? |
+| **500** | **28.1%** | **0.990** (g2) | **0.982** (h1) | **+0.008 — tied** |
 
 So **the deficit was never architectural.** Every symptom diagnosed in §4 — the actor
 collapse, the length-1 plans, the 200k stall, the 0.17 train/val gap — is a symptom of
-overfitting 100 pairs, and all of them dissolve at 500. Do not spend another run on
-capacity, heads, or optimiser tuning aimed at that 0.069.
+overfitting a tiny fraction of the space, and all of them dissolve at 500. Do not spend
+another run on capacity, heads, or optimiser tuning aimed at that 0.069.
+
+> **Read the coverage column, not the pair count.** `16x16_corridors_v1` is a maze of
+> 1-wide passages with only **64 free cells**, so its level-1–14 train pool is just 1,778
+> pairs and 500 of them is **28% of the entire reachable space**. The same flag buys 5.8%
+> on `16x16_room_v1` and 3.1% on `16x16_empty` (§8). **"Both decoders tie at 500 pairs" is
+> therefore a statement about ~28% coverage on one map, not about the number 500.** First
+> confirmation: the Transformer scores **0.838 on `room_v1` at 500 pairs** (5.8% coverage) —
+> close to its 0.725 on corridors at 5.6%, and nowhere near 0.99.
 
 ### 1.2 The real result — sequence-level efficiency at tied success
 
@@ -49,6 +57,13 @@ and it is invisible in accuracy alone:
 Note the last two rows together: a single decode is *slightly more expensive* for the
 Transformer, and it still wins 2.5× on wall-clock per optimal step, because it needs 4×
 fewer of them. **That is the sequence-level argument, measured.**
+
+> **Caveat: corridors is the best possible map for this result.** 64 free cells arranged as
+> 1-wide passages means there are almost no branch points — a committed 10-action plan is
+> nearly always right, because there was never another route to take. On open maps with real
+> route choice, committing long is a worse bet and the 0.936 / 0.573 step-ratio gap may
+> compress. **Whether §1.2 is a property of the decoder or a property of corridors is the
+> sweep's main job (§8)** — it is a more important question than the success column.
 
 ### 1.3 Multi-environment sweep — in flight
 
@@ -181,7 +196,7 @@ Each of these cost real time. Check them before trusting a measurement.
 | **`torch_deterministic`** | Costs 1.71× runtime — via cuBLAS (`CUBLAS_WORKSPACE_CONFIG`), not the convolutions (`conv2d` is 1.2% of the loop). |
 | **The MLP baseline tree is unpatched** | `~/gps-mlp-baseline` sits at 6f627a2, the paper's code drop, and **predates every §7–§9 fix**: accumulating decoder gradient, inference-time dropout, `torch.floor`. Deliberate — it is the published method as published — but **state the asymmetry when reporting**. The dropout one does not apply (the MLP has no dropout layers); the gradient one does. |
 | **`--train_dataset_size` default (100)** | Not a neutral setting. See rule 6 — it is a starvation regime that mimics a capacity ceiling. Both `j1`/`j2` now default to 500; the paper's protocol is the third/second positional argument. |
-| **`--train_dataset_size` is not comparable across maps** | It is an absolute count, drawn from pools that differ by 35×. At levels 1–14, 500 pairs is **24.8%** of 8x8_empty's train pool, **2.0%** of 16x16_empty's, **0.7%** of 24x24_empty's. Comparing success across maps at a fixed count conflates map difficulty with data coverage. Quote coverage, or set the size per map. |
+| **`--train_dataset_size` is not comparable across maps** | It is an absolute count drawn from pools that differ by orders of magnitude, because the maps differ in free space. 500 pairs is **28.1%** of `corridors_v1`'s train pool (64 free cells!), 5.8% of `room_v1`'s, 3.1% of `16x16_empty`'s, 0.7% of `24x24_empty`'s. **Comparing maps at a fixed count conflates difficulty with coverage** — the Transformer's 0.990 on corridors and 0.838 on rooms is mostly this. Quote coverage, or set the size per map (§8 has the table). |
 | **`max_level` (default 14) caps the horizon on every map** | The dataset only ever contains start/goal pairs with optimal path ≤ 14 — so **no map tests long horizons**, whatever its size. 8x8's diameter is 14 (levels 1–14 = 100% of the map), 16x16's is 30 (76% of pairs usable), 24x24's is 46 (46%). **24x24 is short paths on a large canvas, not a longer horizon.** Any horizon-scaling claim needs `max_level` raised with the map, which also changes the pool and the data regime. |
 | **1.0 success on 8x8** | Not leakage — the splits are disjoint (`simplegrid_dataset.py` partitions each level into `[:train]`, `[train:train+eval]`, `[train+eval:]`). It is saturation: a trivial empty grid with a quarter of its pairs in the training set. **8x8 success carries no information**; read the sequence-level metrics or drop the row. |
 | **wandb SDK** | 0.16.4 cannot authenticate against the current backend (`CommError: 'NoneType' object has no attribute 'get'`), and its interactive `wandb login` rejects modern 86-char `wandb_v1_` keys with a 40-char check. Upgrade the SDK; write `~/.netrc` directly if the prompt refuses the key. Never commit the key — one was auto-revoked for exactly that. |
@@ -428,15 +443,34 @@ done
 Fill in from `compare_runs.py`. Success is expected to be ~tied everywhere — **the
 discriminating columns are decisions/ep and step ratio**:
 
-| map | GPT succ | MLP succ | GPT gen/ep | MLP gen/ep | GPT ratio | MLP ratio |
+| map | cov. | GPT succ | MLP succ | GPT gen/ep | MLP gen/ep | GPT ratio | MLP ratio |
+|---|---|---|---|---|---|---|---|
+| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **3.36** | 13.34 | **0.936** | 0.573 |
+| 8x8_empty | 24.8% | | | | | | |
+| 16x16_obstacles_v1_25p | 6.7% | | | | | | |
+| 16x16_room_v1 | 5.8% | **0.838** | | | | | |
+| 16x16_obstacles_v1_15p | 4.4% | | | | | | |
+| 16x16_empty | 3.1% | | | | | | |
+| 24x24_empty | 0.7% | | | | | | |
+
+Ordered by coverage, not by map size — that is the axis the success column actually tracks.
+
+### Coverage, and what matched coverage would cost
+
+`--train_dataset_size 500` on every map is **not** a controlled comparison. Train-pool sizes
+at levels 1–14, by BFS over each map's free cells:
+
+| map | free cells | train pool | 500 = | @6% | @15% | @28% |
 |---|---|---|---|---|---|---|
-| 16x16_corridors_v1 | 0.990 | 0.982 | **3.36** | 13.34 | **0.936** | 0.573 |
-| 8x8_empty | | | | | | |
-| 16x16_empty | | | | | | |
-| 16x16_room_v1 | | | | | | |
-| 16x16_obstacles_v1_15p | | | | | | |
-| 16x16_obstacles_v1_25p | | | | | | |
-| 24x24_empty | | | | | | |
+| 16x16_corridors_v1 | **64** | 1,778 | **28.1%** | 107 | 267 | 498 |
+| 16x16_obstacles_v1_25p | 147 | 7,452 | 6.7% | 447 | 1,118 | 2,087 |
+| 16x16_room_v1 | 160 | 8,626 | 5.8% | 518 | 1,294 | 2,415 |
+| 16x16_obstacles_v1_15p | 167 | 11,454 | 4.4% | 687 | 1,718 | 3,207 |
+| 16x16_empty | 196 | 16,380 | 3.1% | 983 | 2,457 | 4,586 |
+
+Matching coverage at 28% means ~2,000–4,600 pairs on the open maps against corridors' 500.
+A matched-coverage sweep is a *different, more expensive* experiment; this one is a
+fixed-budget sweep and should be reported as such.
 
 ### The three questions this answers
 
