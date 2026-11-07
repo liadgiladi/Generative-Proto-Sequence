@@ -3,11 +3,17 @@
 **Read this before proposing experiments.** It is the current state and the rules that
 earned themselves through failed runs. Full technical detail is in
 [`generative/models/dense_autoencoder/TRANSFORMER_INTEGRATION.md`](generative/models/dense_autoencoder/TRANSFORMER_INTEGRATION.md)
-§7–§9; this file is the orientation layer.
+§7–§10; this file is the orientation layer.
+
+**Writing a summary or a report from this file? Start at §9** — it names the metric the work
+is about (replanning frequency), where to find it, and how it has to be qualified. Leading
+with success rate will produce a misleading document.
 
 Branch: `transformer-integration` (PR #2 against `liadgiladi:main`, draft).
-Task: `16x16_corridors_v1`, from-scratch end-to-end RL (`--train_decoder_end_to_end
---no-initialize_decoder_from_pretrained`). Multi-environment sweep in flight — §1.3.
+Task: from-scratch end-to-end RL (`--train_decoder_end_to_end
+--no-initialize_decoder_from_pretrained`) across all 7 maps the repo ships — §8.
+Thesis direction after the baseline closes: **adaptive replanning with the Transformer**,
+which §8's fixed-3-action finding is the motivation for.
 
 ---
 
@@ -71,10 +77,15 @@ fewer of them. **That is the sequence-level argument, measured.**
 > 3.000-action plan on every map; corridors is simply where that costs nothing.
 > **Do not quote §1.2 without §8.**
 
-### 1.3 Multi-environment sweep — in flight
+### 1.3 Multi-environment sweep — complete, and it reverses the conclusion
 
-Launched at 500 pairs across the six remaining maps (`j1_gpt_map` / `j2_mlp_map`); corridors
-is done and is the table above. Results and the standing question go in **§8**.
+All seven maps, both decoders, 500 pairs. **The Transformer loses on every map except
+corridors** (§8). Confirmation runs in flight: the no-penalty ablation and 1M re-runs of the
+three truncated cells.
+
+> **Writing this up? Read §9 first.** `decoder generations per episode` is the headline
+> metric for the replanning thesis, not success rate — §9 says what it means, where to find
+> it, and how it must be qualified.
 
 ### 1.4 The 100-pair study (superseded, kept for the mechanism it established)
 
@@ -171,10 +182,11 @@ collapsed, what the length penalty actually changes) still hold and still inform
    learning, a hard plateau, a wide train/val gap. We spent wave D, F and most of §4 inside
    it. **Run one 500-pair control before any architectural hypothesis** — it is the same
    cost as the experiment and it decides whether the experiment is worth running at all.
-7. **Success rate saturates; report the sequence-level metrics too.** At 500 pairs both
-   decoders sit at ~0.99 and accuracy can no longer separate them — the separation is 4×
-   in decisions per episode and 1.6× in path optimality (§1.2). Run `compare_runs.py`, not
-   `grep mean success`.
+7. **Never judge a run on success rate alone.** On the easy maps it saturates at ~1.0 and
+   separates nothing; on the hard ones it hides *why*. The informative axes are decisions
+   per episode, path optimality and plan length — and they can point opposite ways from
+   success (§8: the Transformer halves the decisions and still loses). Run
+   `compare_runs.py`, not `grep mean success`, and see **§9** for which columns to report.
 8. **Pin the GPU type.** `--gpus=gtx_1080:1`, never a bare `--gpus=1` — the partition has
    `gtx_1080`, `rtx_2080` and `rtx_3090`, and one experiment silently landed on different
    silicon. (GPU model barely affects *speed* here — the workload is CPU-side dispatch
@@ -350,7 +362,8 @@ under-powered — D4 tests a 4× weight.
 | `sbatch/g4_multihead_clipped.sbatch` | Multi-head retry with Q clipping and actor clipping, the guards A1–A3 lacked. |
 | `sbatch/h1`/`h2_mlp_*pairs.sbatch` | The MLP at 500 / 300 pairs — the matched-data baseline for g2 / g1. |
 | `sbatch/i1`–`i3_empty_*.sbatch` | `16x16_empty` at 100 pairs. Superseded by the `j`-series at 500; run them only for a paper-protocol comparison. |
-| **`sbatch/j1_gpt_map.sbatch`**, **`j2_mlp_map.sbatch`** | **Parameterised by map** — the multi-environment sweep (§8). `j1 <map> [length_weight] [pairs]`, `j2 <map> [pairs]`; both default to 500 pairs. `j1 <map> 0` is the no-length-penalty arm. |
+| **`sbatch/j1_gpt_map.sbatch`**, **`j2_mlp_map.sbatch`** | **Parameterised by map** — the multi-environment sweep (§8). `j1 <map> [length_weight] [pairs] [total_steps]`, `j2 <map> [pairs]`; both default to 500 pairs, j1 to 500k steps. `j1 <map> 0` is the no-length-penalty arm; `j1 <map> 0.002 500 1000000` matches the MLP's budget. |
+| `sbatch/j3_dqn_map.sbatch` | Plain DQN, the non-GPS arm. **Not needed for the decoder comparison** — j1 and j2 are both GPS — and the paper already publishes DQN/TempoRL/DAR baselines. Kept in case a GPS-vs-RL claim is ever wanted in-house. |
 
 Checkpoints live in `runs/<wandb-run-name>/{actor,critic,decoder}`, written whenever
 validation success improves. **Only the validation evaluation ever saves**; the train and
@@ -417,8 +430,10 @@ sbatch sbatch/d6_d4_repeat.sbatch                     # best-known config, corri
 sbatch sbatch/eval_checkpoint.sbatch runs/<run-dir>   # recover a dead run's test numbers
 ```
 
-**Reading results — use `compare_runs.py`, not grep.** Success rate alone is saturated at
-500 pairs and will tell you the two decoders are identical (§1.2):
+**Reading results — use `compare_runs.py`, not grep.** Success rate alone saturates on the
+easy maps and hides the mechanism on the hard ones; §9 lists the columns to report. A
+`grep -m1` on an MLP log returns an *early-training* number (§3) — this has inverted a
+conclusion once already.
 
 ```bash
 poetry run python compare_runs.py --csv all_maps.csv sbatch/logs/j1_*.out sbatch/logs/j2_*.out
@@ -445,7 +460,7 @@ checkpoint.
 ## 8. Multi-environment sweep — 500 pairs, GPT vs MLP
 
 The paper evaluates 9 environments; **this repo ships 7** (both 24x24 obstacle maps are
-absent). Corridors is done; the other six are in flight as of 2026-11-04.
+absent).
 
 ```bash
 MAPS="8x8_empty 16x16_empty 16x16_room_v1 16x16_obstacles_v1_15p 16x16_obstacles_v1_25p 24x24_empty"
@@ -454,9 +469,6 @@ for m in $MAPS; do
   sbatch sbatch/j2_mlp_map.sbatch "$m"
 done
 ```
-
-Fill in from `compare_runs.py`. Success is expected to be ~tied everywhere — **the
-discriminating columns are decisions/ep and step ratio**:
 
 **Complete, 2026-11-07. The Transformer loses on every non-trivial map.**
 
@@ -524,15 +536,13 @@ Matching coverage at 28% means ~2,000–4,600 pairs on the open maps against cor
 A matched-coverage sweep is a *different, more expensive* experiment; this one is a
 fixed-budget sweep and should be reported as such.
 
-### The three questions this answers
+### The questions it answered
 
+- **Does path optimality survive clutter?** **No.** The 0.936 step ratio was corridors-only;
+  under clutter the MLP overtakes on every map (§8 table). This was the sweep's main job.
 - **~~Does the advantage scale with horizon?~~** Not answerable here — `max_level 14` fixes
-  the horizon on every map. See the caveat below. What the map size *does* vary is the
-  observation and the data coverage, so a trend across sizes is a coverage trend.
-- **Does path optimality survive clutter?** 15p → 25p obstacles. The 0.936 step ratio was
-  measured on corridors, which reward committing to long straight runs. If it holds under
-  clutter the result generalises; if the MLP catches up, it was corridor-specific.
-- **Is anything clipped by the plan-length ceiling?** See the caveat below.
+  the horizon on every map (caveat below). Map size varies the observation and the coverage,
+  not the horizon.
 
 ### Caveat — the sweep cannot answer the horizon question
 
@@ -544,15 +554,21 @@ told readers to watch for the `n_actions_in_seq=10` ceiling there — wrong. Tha
 
 Coverage at levels 1–14, which is what actually varies:
 
-| map | usable pairs | 500 train pairs | diameter |
-|---|---|---|---|
-| 8x8_empty | 4,032 (100% of the map) | **24.8%** of the pool | 14 |
-| 16x16_empty | 49,840 (76%) | 2.0% | 30 |
-| 24x24_empty | 151,760 (46%) | 0.7% | 46 |
+By BFS over each map's actual free cells (the three "empty" maps are not all equally empty —
+16x16 and 24x24 carry a wall border, 8x8 does not):
 
-So **8x8 is saturated by construction** — a quarter of every pair that exists, on a trivial
-grid. Expect 1.0 from both decoders and read only the sequence-level columns there. At the
-other end, 24x24 at 0.7% is closer to the starvation regime of §1.1 than to corridors' 500.
+| map | free cells | reachable pairs | at level 1–14 | train pool | 500 pairs = |
+|---|---|---|---|---|---|
+| 8x8_empty | 64 | 4,032 | 4,032 (**100%**) | 2,016 | **24.8%** |
+| 16x16_empty | 196 | 38,220 | 32,760 (86%) | 16,380 | 3.1% |
+| 24x24_empty | 484 | 233,772 | 121,240 (52%) | 60,620 | 0.8% |
+
+So **8x8 is saturated by construction** — its diameter *is* 14, so levels 1–14 is the whole
+map and 500 pairs is a quarter of every pair that exists. Expect 1.0 from both decoders and
+read only the sequence-level columns there.
+
+(Coverage does **not** order the results — the MLP reaches 0.973 on 24x24_empty at 0.8%.
+It explains only why 100 pairs looked starved on corridors, §1.1.)
 
 A genuine horizon-scaling experiment needs `max_level` raised with the map (e.g. 14 / 30 /
 46), which changes the pool size too and so needs the data regime re-fixed per map. That is
@@ -563,8 +579,89 @@ a different sweep, not a re-read of this one.
 1. **500 pairs, not the paper's 100.** Deliberate (§1.1) — at 100 the comparison measures
    starvation. Any direct comparison to the paper's published numbers must use 100.
 2. **The MLP tree is unpatched** — accumulating decoder gradient, see §3.
-3. **1M steps for the MLP, 500k for the GPT.** Not an oversight: the MLP's best validation
-   landed at step 999,999 on corridors (still climbing) while the Transformer peaks around
-   200k. Equal step counts would handicap the MLP; this gives each its own best case.
-4. **n=1 per cell.** No noise floor on the sequence-level metrics yet. A 4× ratio is safe
-   to quote; anything under ~1.5× is not.
+3. **1M steps for the MLP, 500k for the GPT** in the first sweep. Not an oversight: the
+   MLP's best validation landed at step 999,999 on corridors (still climbing) while the
+   Transformer peaks around 200k, so equal budgets would have handicapped the MLP. But it
+   did not transfer — three GPT cells hit their budget wall (⚠ above) and are being re-run
+   at 1M. Quote the 1M numbers once they land.
+4. **n=1 per cell** in the first sweep. A 4× ratio is safe to quote; anything under ~1.5×
+   is not, and the −0.010 on 16x16_empty is not a result. Second seeds are in flight on the
+   four maps the conclusion rests on.
+5. **The Transformer has a working length penalty; the MLP's is dead.** `torch.floor`
+   (§3) silently disabled `--sequence_length_weight` in the paper's tree, so `j2` runs
+   without it while `j1` runs at 0.002. The `j1 <map> 0` arms are the control.
+
+---
+
+## 9. Reporting — the metric this work is actually about
+
+**For anyone writing this up: lead with replanning frequency, not success rate.**
+
+Success rate answers "did it reach the goal", which both decoders do on the easy maps and
+which the MLP simply wins on the hard ones. It is the *control* variable. The thesis
+direction is **adaptive replanning with a Transformer**, and the quantity that measures
+replanning is:
+
+### `decoder generations per episode`
+
+| where | exact name |
+|---|---|
+| slurm log | `test dataset with critic mean num decoder generations: <value>` |
+| `compare_runs.py` | row `decoder generations/ep` |
+| wandb | `test-eval-with-critic/mean_num_decoder_generations` (and the `-deterministic` variant) |
+| source | `gps_simplegrid_levels.py:595` — incremented once per `get_reward_per_sequence` call |
+
+**What it is.** The number of times the decoder was invoked to produce a fresh plan during
+one episode — i.e. **how many times the agent replanned**. It is counted over successful
+episodes only and averaged across the 1,000 test episodes.
+
+**Why it is the right headline.** GPS's whole claim is that acting over sequences means
+deciding less often. This is that claim as a number. A policy that replans at every step is
+doing single-step control with extra machinery; one that replans 3 times per episode is
+genuinely operating at the sequence level. Current baseline, 500 pairs:
+
+| | corridors | 8x8 | empty | room | obs15 | obs25 | 24x24 |
+|---|---|---|---|---|---|---|---|
+| **GPT** | **3.36** | 2.19 | 3.70 | 5.57 | 5.23 | 6.57 | 7.63 |
+| MLP | 13.34 | 3.92 | 5.73 | 11.56 | 10.66 | 13.66 | 12.40 |
+
+The Transformer replans roughly **half as often on every map**, and 4× less on corridors.
+That advantage is the one §8 result that survives everywhere.
+
+**How it must be qualified — never quote it alone.** The metric is trivially gamed: emit one
+enormous plan, replan once, fail the episode. Three companions make it honest, and all three
+come out of the same `compare_runs.py` table:
+
+| companion | why |
+|---|---|
+| `success` | did it actually reach the goal? Fewer decisions at lower success is not a win. |
+| `agent step ratio` | optimal steps ÷ actual steps. Fewer decisions that produce *longer wandering paths* is not a win either — and this is exactly where the Transformer currently loses (0.601–0.735 vs the MLP's 0.701–0.825 on the hard maps). |
+| `valid actions/seq` | the emitted plan length. The Transformer's is pinned at **3.000** everywhere, which is why its replanning count is low — fixed stride, not adaptation. **This is the defect the thesis addresses.** |
+
+**The honest one-sentence summary of the baseline**, as of 2026-11-07:
+
+> The Transformer decoder replans about half as often as the MLP on every environment, but
+> because it commits to a fixed 3-action plan regardless of state, it reaches the goal less
+> often and takes less direct paths on every map that offers a real route choice. Only on
+> `16x16_corridors_v1` — 1-wide passages, almost no branch points — does committing cost
+> nothing, and that is the one map where it wins.
+
+That sentence is the motivation for adaptive replanning: the commitment mechanism works, the
+*decision of when to commit* does not exist yet.
+
+### Also worth a table in any write-up
+
+| metric | log name | what it adds |
+|---|---|---|
+| `agent step ratio` | `mean agent step ratio in sequences per episode` | path optimality, 0–1 |
+| `valid actions/seq` | `mean num valid actions in sequences per episode` | plan length (despite the name — it is `len(actions)`, `gps_simplegrid_levels.py:609`) |
+| `unused actions/seq` | `mean num unused actions in sequences per episode` | plan waste: emitted minus executed |
+| `revisits (global)` | `mean global visited position count in sequences per episode` | wandering |
+| `wall-clock / optimal step` | `average wall-clock time per optimal step` | compute per unit of real progress |
+| `inference / decision` | `average inference time per decision` | per-call cost; near-identical between decoders, which is what makes the decision *count* the interesting axis |
+
+Generate all of them with:
+
+```bash
+python compare_runs.py --csv all_maps.csv sbatch/logs/j1_*.out sbatch/logs/j2_*.out
+```
