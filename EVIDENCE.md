@@ -30,13 +30,17 @@ collapse, the length-1 plans, the 200k stall, the 0.17 train/val gap — is a sy
 overfitting a tiny fraction of the space, and all of them dissolve at 500. Do not spend
 another run on capacity, heads, or optimiser tuning aimed at that 0.069.
 
-> **Read the coverage column, not the pair count.** `16x16_corridors_v1` is a maze of
-> 1-wide passages with only **64 free cells**, so its level-1–14 train pool is just 1,778
-> pairs and 500 of them is **28% of the entire reachable space**. The same flag buys 5.8%
-> on `16x16_room_v1` and 3.1% on `16x16_empty` (§8). **"Both decoders tie at 500 pairs" is
-> therefore a statement about ~28% coverage on one map, not about the number 500.** First
-> confirmation: the Transformer scores **0.838 on `room_v1` at 500 pairs** (5.8% coverage) —
-> close to its 0.725 on corridors at 5.6%, and nowhere near 0.99.
+> **This table is corridors only, and corridors is the outlier — see §8.** On the six other
+> maps the MLP scores 0.95–1.00 at 500 pairs and the Transformer scores 0.12–0.99, losing
+> every non-trivial one. The §1.1 finding that **more data closes the gap on corridors**
+> still stands as stated; what does *not* follow is that the two decoders are equivalent in
+> general. They are not. Corridors is the single map where the Transformer's fixed 3-action
+> plan costs nothing.
+>
+> Coverage (28.1% here vs 3–7% elsewhere) explains why 100 pairs looked starved on this map.
+> It does **not** explain the cross-map results — the MLP reaches 0.973 on 24x24_empty at
+> 0.8% coverage. An earlier version of this file claimed coverage was the ordering variable;
+> it is not.
 
 ### 1.2 The real result — sequence-level efficiency at tied success
 
@@ -58,12 +62,14 @@ Note the last two rows together: a single decode is *slightly more expensive* fo
 Transformer, and it still wins 2.5× on wall-clock per optimal step, because it needs 4×
 fewer of them. **That is the sequence-level argument, measured.**
 
-> **Caveat: corridors is the best possible map for this result.** 64 free cells arranged as
-> 1-wide passages means there are almost no branch points — a committed 10-action plan is
-> nearly always right, because there was never another route to take. On open maps with real
-> route choice, committing long is a worse bet and the 0.936 / 0.573 step-ratio gap may
-> compress. **Whether §1.2 is a property of the decoder or a property of corridors is the
-> sweep's main job (§8)** — it is a more important question than the success column.
+> **This is a property of corridors, not of the decoder — settled by §8.** 64 free cells in
+> 1-wide passages means almost no branch points, so a committed multi-step plan is nearly
+> always right because there was never another route. The sweep ran the same config on six
+> other maps: the decision-count advantage survives (~2× fewer generations everywhere), but
+> **the step-ratio advantage inverts** — on every cluttered map the Transformer's paths are
+> *worse* than the MLP's, and success drops 0.14–0.85. The Transformer emits a rigid
+> 3.000-action plan on every map; corridors is simply where that costs nothing.
+> **Do not quote §1.2 without §8.**
 
 ### 1.3 Multi-environment sweep — in flight
 
@@ -198,6 +204,7 @@ Each of these cost real time. Check them before trusting a measurement.
 | **`--train_dataset_size` default (100)** | Not a neutral setting. See rule 6 — it is a starvation regime that mimics a capacity ceiling. Both `j1`/`j2` now default to 500; the paper's protocol is the third/second positional argument. |
 | **`--train_dataset_size` is not comparable across maps** | It is an absolute count drawn from pools that differ by orders of magnitude, because the maps differ in free space. 500 pairs is **28.1%** of `corridors_v1`'s train pool (64 free cells!), 5.8% of `room_v1`'s, 3.1% of `16x16_empty`'s, 0.7% of `24x24_empty`'s. **Comparing maps at a fixed count conflates difficulty with coverage** — the Transformer's 0.990 on corridors and 0.838 on rooms is mostly this. Quote coverage, or set the size per map (§8 has the table). |
 | **`max_level` (default 14) caps the horizon on every map** | The dataset only ever contains start/goal pairs with optimal path ≤ 14 — so **no map tests long horizons**, whatever its size. 8x8's diameter is 14 (levels 1–14 = 100% of the map), 16x16's is 30 (76% of pairs usable), 24x24's is 46 (46%). **24x24 is short paths on a large canvas, not a longer horizon.** Any horizon-scaling claim needs `max_level` raised with the map, which also changes the pool and the data regime. |
+| **`grep -m1` on an MLP log gives an early-training number** | `j2` does not pass `--eval_test_dataset_during_training_freq -1`, so MLP logs contain **many** `test dataset with critic mean success:` lines — the periodic evaluations — and the final one is last, not first. A `grep -m1` over the j2 sweep logs returned 0.12–0.33 where the true finals were 0.95–1.00, which inverted the entire sweep conclusion. **Use `compare_runs.py`** (it takes the last match) or `grep ... \| tail -1`. |
 | **1.0 success on 8x8** | Not leakage — the splits are disjoint (`simplegrid_dataset.py` partitions each level into `[:train]`, `[train:train+eval]`, `[train+eval:]`). It is saturation: a trivial empty grid with a quarter of its pairs in the training set. **8x8 success carries no information**; read the sequence-level metrics or drop the row. |
 | **wandb SDK** | 0.16.4 cannot authenticate against the current backend (`CommError: 'NoneType' object has no attribute 'get'`), and its interactive `wandb login` rejects modern 86-char `wandb_v1_` keys with a 40-char check. Upgrade the SDK; write `~/.netrc` directly if the prompt refuses the key. Never commit the key — one was auto-revoked for exactly that. |
 
@@ -378,18 +385,26 @@ test evaluations are logging only.
 
 ### Next, in order
 
-1. **The multi-environment sweep — in flight.** Fill in §8 as logs land. This is now the
-   main line of work; everything below waits on it.
-2. **Second seed on two or three maps**, once the sweep shows where the effect is largest.
-   The sequence-level metrics have no measured noise floor yet — §1.2 is n=1 per arm, and
-   a 4× ratio is almost certainly real while a 1.2× one is not.
-3. **Reconstruction pretraining** — still the only substantial untried lever, and now a
-   better bet than when it was parked: at 500 pairs the decoder is no longer starved, so
-   a pretrained one has something to improve *on* rather than a collapsed actor to fight.
-   A day of work on the §4.1–4.3 standalone loop before a single run.
+The sweep (§8) changed the problem. The Transformer is not competitive off corridors, and
+the proximate cause is visible: **a fixed 3.000-action plan on every map.**
 
-**Do not** re-open capacity, multi-head, or length/soft-feedback tuning. All three were
-aimed at a 0.069 gap that no longer exists.
+1. **The `weight 0` arms — in flight** (jobs 23971719–21, on `16x16_empty`, `room_v1`,
+   `obstacles_15p`). Does the rigidity come from `--sequence_length_weight`? If plan length
+   varies by map without the penalty, the penalty we tuned on corridors is the bug.
+2. **Re-run the three truncated maps at 1M steps.** room, obstacles_15p and obstacles_25p
+   peaked at 470k–499,999 against a 500k budget, so their gaps are inflated. `--total_timesteps
+   500000` was validated on corridors only and does not transfer. Cheap, and it bounds how
+   much of the deficit is real.
+3. **Then the actual question: make plan length state-dependent.** A policy that commits to
+   3 actions regardless of whether it is in a corridor or a cluttered room is not doing
+   sequence-level decision making, it is doing fixed-stride decision making. Candidates: a
+   learned stop token, per-state length conditioning, or letting the critic choose among
+   candidate plans of differing length (needs `n_proto_plan_candidates > 1`, see §3).
+4. **Reconstruction pretraining** — unchanged in priority, but note it addresses sequence
+   *quality*, not the length rigidity that §8 identifies as the binding problem.
+
+**Do not** re-open capacity, multi-head-for-accuracy, or soft-feedback tuning: all were
+aimed at the corridors-only 0.069 gap, which §8 shows was never the real problem.
 
 ---
 
@@ -443,17 +458,54 @@ done
 Fill in from `compare_runs.py`. Success is expected to be ~tied everywhere — **the
 discriminating columns are decisions/ep and step ratio**:
 
-| map | cov. | GPT succ | MLP succ | GPT gen/ep | MLP gen/ep | GPT ratio | MLP ratio |
-|---|---|---|---|---|---|---|---|
-| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **3.36** | 13.34 | **0.936** | 0.573 |
-| 8x8_empty | 24.8% | | | | | | |
-| 16x16_obstacles_v1_25p | 6.7% | | | | | | |
-| 16x16_room_v1 | 5.8% | **0.838** | | | | | |
-| 16x16_obstacles_v1_15p | 4.4% | | | | | | |
-| 16x16_empty | 3.1% | | | | | | |
-| 24x24_empty | 0.7% | | | | | | |
+**Complete, 2026-11-07. The Transformer loses on every non-trivial map.**
 
-Ordered by coverage, not by map size — that is the axis the success column actually tracks.
+| map | cov. | GPT succ | MLP succ | gap | GPT gen/ep | MLP gen/ep | GPT ratio | MLP ratio | GPT best-val step |
+|---|---|---|---|---|---|---|---|---|---|
+| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **+0.008** | **3.36** | 13.34 | **0.936** | 0.573 | ~200k |
+| 8x8_empty | 24.8% | 1.000 | 1.000 | 0.000 | 2.19 | 3.92 | 0.977 | 0.934 | 425,000 |
+| 16x16_empty | 3.1% | 0.990 | 1.000 | −0.010 | 3.70 | 5.73 | 0.914 | 0.889 | 425,000 |
+| 16x16_room_v1 | 5.8% | 0.838 | 0.980 | −0.142 | 5.57 | 11.56 | 0.735 | 0.774 | **499,999** ⚠ |
+| 16x16_obstacles_v1_15p | 4.4% | 0.824 | 0.987 | −0.163 | 5.23 | 10.66 | 0.705 | 0.825 | 470,000 ⚠ |
+| 16x16_obstacles_v1_25p | 6.7% | 0.505 | 0.953 | −0.448 | 6.57 | 13.66 | 0.636 | 0.701 | **499,999** ⚠ |
+| 24x24_empty | 0.8% | 0.120 | 0.973 | −0.853 | 7.63 | 12.40 | 0.601 | 0.717 | 295,000 |
+
+**Corridors is the outlier, not the rule.** It is the one map where the Transformer wins, and
+the entire §1–§4 investigation ran on it. The MLP is at 0.95–1.00 everywhere.
+
+**Coverage is not the explanatory variable** — an earlier version of this section said it
+was. The MLP scores 0.973 on 24x24_empty at **0.8%** coverage, so neither decoder is
+coverage-limited in this range. Coverage still explains why corridors at 100 pairs looked
+starved (§1.1), but it does not order this table.
+
+⚠ **Three GPT runs were truncated.** `--total_timesteps 500000` was validated on corridors,
+where validation peaks ~200k. On room and obstacles_25p the GPT's best validation is at step
+**499,999** — still improving when the budget ran out — and obstacles_15p at 470,000. Those
+three rows are GPT-at-500k against MLP-at-1M and the gap is inflated by an unknown amount.
+**Re-run them at 1M before quoting those numbers.** 24x24 is not truncated (peak 295k, then
+decline) — that one is a real failure.
+
+#### The mechanism: the Transformer emits a rigid 3-action plan everywhere
+
+| `valid actions/seq` | 8x8 | empty | room | obs15 | obs25 | 24x24 |
+|---|---|---|---|---|---|---|
+| **GPT** | 3.003 | 3.002 | **3.000** | **3.000** | **3.000** | **3.000** |
+| MLP | 1.638 | 1.798 | 1.127 | 1.086 | 1.115 | 1.255 |
+
+Exactly 3.000 across four structurally different maps is a degenerate policy, not adaptation
+— and the length bands ask for 4–10. On corridors a blind multi-step commitment is nearly
+free (1-wide passages, no branch points); on cluttered maps it is actively wrong. The cost
+shows up in the derived metrics: the GPT's step ratio is **worse than the MLP's on every
+hard map** (0.735/0.705/0.636/0.601 vs 0.774/0.825/0.701/0.717) and its global revisits are
+higher (1.16/0.96/1.39/2.12 vs 0.75/0.46/1.29/1.20).
+
+The §1.2 decision-count advantage does survive — about half the generations per episode on
+every map — but here it buys worse paths and lower success, where on corridors it bought
+both. **A fixed 3-action commitment is the whole story, and corridors is the one map where
+it is free.**
+
+Open: whether the rigidity is the length penalty's doing. The `j1 <map> 0` arms on
+`16x16_empty`, `room_v1` and `obstacles_15p` (jobs 23971719–21) test exactly that.
 
 ### Coverage, and what matched coverage would cost
 
