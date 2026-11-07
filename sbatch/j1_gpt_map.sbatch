@@ -1,10 +1,11 @@
 #!/bin/bash
 # J1 -- Transformer decoder on any map.  Parameterised: the map is an argument.
 #
-#   sbatch sbatch/j1_gpt_map.sbatch <obstacle_map> [sequence_length_weight]
+#   sbatch sbatch/j1_gpt_map.sbatch <map> [length_weight] [train_pairs] [total_steps]
 #
-#   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p          # tuned (0.002)
-#   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p 0        # plain, no penalty
+#   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p                     # tuned (0.002)
+#   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p 0                   # plain, no penalty
+#   sbatch sbatch/j1_gpt_map.sbatch 16x16_obstacles_v1_25p 0.002 500 1000000   # 1M, matches the MLP
 #
 # The paper evaluates 9 environments; this repo ships 7 of them (both 24x24 obstacle maps
 # are absent):
@@ -32,7 +33,9 @@
 # needs far more generations per episode, the plan length is the limit, not the decoder.
 #
 #SBATCH --partition=main
-#SBATCH --time=0-12:00:00
+# 1 day, not 12h: a 500k run takes 3-7h depending on the map, so a 1M run on the slower
+# maps (obstacles_15p was 5.45h at 500k) would be killed at a 12h wall mid-training.
+#SBATCH --time=1-00:00:00
 #SBATCH --job-name=j1_gpt_map
 #SBATCH --output=sbatch/logs/j1_gpt_map-%J.out
 #SBATCH --gpus=gtx_1080:1
@@ -50,6 +53,12 @@ LENGTH_WEIGHT="${2:-0.002}"
 # decoder generations per episode, 0.936 vs 0.573 agent step ratio. That is the paper's
 # actual claim, and it only becomes visible once accuracy saturates.
 TRAIN_PAIRS="${3:-500}"
+# 500k was validated on corridors, where validation peaks around 200k. It does NOT transfer:
+# on room_v1 and obstacles_25p the best validation landed at step 499,999 -- still improving
+# when the budget ran out -- and obstacles_15p at 470,000. Those three need 1M to be
+# comparable against the MLP, which gets 1M everywhere. Check "best val mean global step" in
+# the log: within ~10% of the budget means the run was cut short and its score is a floor.
+TOTAL_STEPS="${4:-500000}"
 
 if [ -z "${MAP}" ]; then
     echo "ERROR: pass the obstacle map, e.g."
@@ -84,7 +93,7 @@ poetry run python gps_simplegrid_levels.py \
     --no-initialize_decoder_from_pretrained \
     --decoder_use_cuda_graph \
     --eval_test_dataset_during_training_freq -1 \
-    --total_timesteps 500000 \
+    --total_timesteps "${TOTAL_STEPS}" \
     --total_steps_e 15000 \
     --n_proto_plan_candidates 1 \
     --min_qf_value -20.0 \
