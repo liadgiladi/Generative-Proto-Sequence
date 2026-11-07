@@ -936,3 +936,149 @@ independent of success rate.
   it attacks the real difficulty, a from-scratch autoregressive model learning sequence
   structure from sparse reward, and would train the encoder the item above needs. Blocked on
   the §4.1–4.3 standalone-loop fixes.
+
+> ⚠️ **§9.10's closing status is superseded by §10.** "~0.725–0.742 against the MLP's 0.794,
+> a gap of ~0.06" describes `16x16_corridors_v1` at 100 training pairs. Both halves of that
+> turned out to be unrepresentative: the gap is a data artifact (§10.1), and corridors is the
+> one map of seven where the Transformer is competitive at all (§10.3).
+
+---
+
+## 10. The data regime, and the multi-environment sweep (round 5)
+
+Everything in §6–§9 was measured on **one map at 100 training pairs**. Round 5 varied both,
+and both turned out to matter more than any architectural change tried in §6–§9.
+
+### 10.1 The corridors gap was data starvation, not architecture
+
+`--train_dataset_size` defaults to 100, matching the paper's protocol. Raising it:
+
+| training pairs | GPT (tuned) | MLP | gap |
+|---|---|---|---|
+| 100 | 0.725 ± 0.018 (n=5) | 0.794 | −0.069 |
+| 300 | 0.897 (`g1`) | — | — |
+| **500** | **0.990** (`g2`) | **0.982** (`h1`) | **+0.008** |
+
+The 0.069 gap that §8–§9 spent two waves of experiments on **closes completely at 500
+pairs.** Every symptom §8.3 diagnosed — the actor collapse, `mean_len = 1.01`, the 200k
+stall, the 0.17 train/val gap — is a symptom of overfitting 100 pairs on one map.
+
+Capacity (§4 F1/F2), multi-head, and further length/soft-feedback tuning were all aimed at
+that gap and are closed accordingly.
+
+**But read coverage, not the pair count.** `16x16_corridors_v1` is a maze of 1-wide passages
+with only **64 free cells**, so its level-1–14 train pool is 1,778 pairs and 500 of them is
+**28% of the entire reachable space**. The same flag buys 5.8% on `16x16_room_v1` and 3.1%
+on `16x16_empty`. See §10.5.
+
+### 10.2 Sequence-level metrics at tied success — on corridors
+
+With success tied at ~0.99, `compare_runs.py` (new, repo root) pulls the rest of the paper's
+metric set. `g2` vs `h1`, both 500 pairs:
+
+| | GPT | MLP |
+|---|---|---|
+| success | 0.990 | 0.982 |
+| **decoder generations/ep** | **3.36** | 13.34 |
+| **agent step ratio** | **0.936** | 0.573 |
+| actions/ep | 10.1 | 25.1 |
+| revisits (global) | 0.12 | 1.94 |
+| wall-clock / optimal step | **0.0041 s** | 0.0102 s |
+| inference / decision | 0.0029 s | 0.0025 s |
+
+A single decode is *slightly more expensive* for the Transformer and it still wins 2.5× on
+wall-clock per optimal step, because it needs 4× fewer. **This result does not survive
+§10.3** — it is a property of corridors.
+
+### 10.3 The multi-environment sweep — the conclusion reverses
+
+`sbatch/j1_gpt_map.sbatch` (Transformer) and `j2_mlp_map.sbatch` (MLP, run against the
+unmodified paper tree at `6f627a2`), 500 pairs, all seven maps the repo ships. The paper
+evaluates 9; both 24x24 obstacle maps are absent here.
+
+| map | coverage | **GPT** | **MLP** | gap | GPT best-val step |
+|---|---|---|---|---|---|
+| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **+0.008** | ~200k |
+| 8x8_empty | 24.8% | 1.000 | 1.000 | 0.000 | 425,000 |
+| 16x16_empty | 3.1% | 0.990 | 1.000 | −0.010 | 425,000 |
+| 16x16_room_v1 | 5.8% | 0.838 | 0.980 | −0.142 | **499,999** ⚠ |
+| 16x16_obstacles_v1_15p | 4.4% | 0.824 | 0.987 | −0.163 | 470,000 ⚠ |
+| 16x16_obstacles_v1_25p | 6.7% | 0.505 | 0.953 | −0.448 | **499,999** ⚠ |
+| 24x24_empty | 0.8% | 0.120 | 0.973 | −0.853 | 295,000 |
+
+**The MLP sits at 0.95–1.00 on every map. Corridors is the single map where the Transformer
+wins, and it is the map this entire investigation ran on.**
+
+Coverage does **not** order this table — the MLP reaches 0.973 on 24x24_empty at 0.8%
+coverage. Neither decoder is coverage-limited in this range.
+
+⚠ **Three GPT runs were truncated.** `--total_timesteps 500000` was validated on corridors,
+where validation peaks ~200k. On room and obstacles_25p the best validation is at step
+**499,999** — still improving at the budget wall — and obstacles_15p at 470,000. Those three
+gaps are upper bounds. `j1` now takes `total_steps` as a 4th argument; 1M re-runs are in
+flight. 24x24 is **not** truncated (peak 295k, then decline) — that one is a real failure.
+
+### 10.4 The mechanism — a fixed 3-action plan
+
+`valid actions/seq` (despite the name, this is `len(actions)`, the emitted plan length —
+`gps_simplegrid_levels.py:609`):
+
+| | 8x8 | empty | room | obs15 | obs25 | 24x24 |
+|---|---|---|---|---|---|---|
+| **GPT** | 3.003 | 3.002 | **3.000** | **3.000** | **3.000** | **3.000** |
+| MLP | 1.638 | 1.798 | 1.127 | 1.086 | 1.115 | 1.255 |
+
+**Exactly 3.000 across four structurally different maps is a degenerate policy, not
+adaptation** — and the length bands ask for 4–10. The Transformer emits the same fixed-stride
+commitment everywhere, corridors included (3.01 there).
+
+On corridors a blind multi-step commitment is nearly free: 1-wide passages have almost no
+branch points, so a committed plan is right because there was never another route. On maps
+with real route choice it is wrong, and the cost shows in every derived metric:
+
+| | room | obs15 | obs25 | 24x24 |
+|---|---|---|---|---|
+| step ratio, GPT vs MLP | 0.735 / **0.774** | 0.705 / **0.825** | 0.636 / **0.701** | 0.601 / **0.717** |
+| revisits (global), GPT vs MLP | 1.158 / **0.746** | 0.959 / **0.464** | 1.385 / **1.291** | 2.117 / **1.203** |
+
+The §10.2 decision-count advantage *does* survive — roughly half the generations per episode
+on every map — but here it buys worse paths and lower success, where on corridors it bought
+both.
+
+**Open:** whether the rigidity is caused by `--sequence_length_weight`, the lever §9.10
+identified as dominant and tuned on corridors. `j1 <map> 0` arms are running on all five
+non-trivial maps to find out. If plan length varies by map without the penalty, the
+regulariser is the problem; if it stays at 3.000, the rigidity is in the decoder or actor.
+
+### 10.5 Measurement traps found in this round
+
+| trap | what happens |
+|---|---|
+| **`grep -m1` on an MLP log** | `j2` does not pass `--eval_test_dataset_during_training_freq -1`, so MLP logs contain **many** `test dataset with critic mean success:` lines — the periodic evaluations — and the final one is last, not first. A `-m1` grep over the sweep returned 0.12–0.33 where the true finals were 0.95–1.00, **inverting the conclusion**. Use `compare_runs.py` (takes the last match) or `\| tail -1`. |
+| **`--train_dataset_size` across maps** | An absolute count over pools that differ by orders of magnitude. 500 pairs = 28.1% of corridors' train pool, 5.8% of room_v1's, 3.1% of 16x16_empty's, 0.8% of 24x24_empty's. Not a controlled comparison; quote coverage. |
+| **`max_level` (default 14)** | Caps **every** map at 14-step optimal paths, so no map in this repo tests long horizons. 24x24_empty is short paths on a large canvas (diameter 46, only 46% of its pairs usable), not a longer horizon. A horizon-scaling experiment needs `max_level` raised per map, which changes the pool too. |
+| **1.0 success on 8x8** | Not leakage — `simplegrid_dataset.py` partitions each level disjointly. Saturation: 8x8_empty's diameter *is* 14, so levels 1–14 is the whole map and 500 pairs is a quarter of it. 8x8 success carries no information. |
+
+### 10.6 Status
+
+**Runtime: resolved** (§7). 50.3 h → 3–7 h per 500k run depending on the map.
+
+**Accuracy: the Transformer decoder is not competitive with the MLP off corridors.** Six of
+seven maps favour the MLP, three of those by truncated margins pending the 1M re-runs. The
+proximate cause is named and measurable: a fixed 3.000-action plan regardless of state.
+
+**What a fix would have to look like.** A policy that commits to 3 actions whether it is in
+a corridor or a cluttered room is doing fixed-stride, not sequence-level, decision making.
+Candidates, in rough order of cost: a learned stop token; per-state length conditioning;
+letting the critic choose among candidate plans of differing length (needs
+`n_proto_plan_candidates > 1`, which needs §9.2's clip — now available). **Reconstruction
+pretraining** (§6.5, §9.10) remains the highest-ceiling option but addresses sequence
+*quality*, not the length rigidity §10.4 identifies as binding.
+
+**A note on GPS itself, held loosely.** The winning arm plans 1.1–1.8 actions ahead — close
+to single-step control, and close to the "collapse" §8.3 diagnosed as *our* pathology. That
+makes "does sequence-level decision making beat a 1-step agent here?" an open question this
+comparison cannot answer, because both arms are GPS. `dqn_simplegrid_levels.py` is already in
+the repo and `sbatch/j3_dqn_map.sbatch` runs it at a matched 1M environment-step budget
+(both scripts increment `global_step` per environment step). `temporl_` and `dar_` are the
+two temporal-abstraction baselines to add after it.
