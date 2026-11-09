@@ -157,6 +157,21 @@ def main() -> None:
     if not runs:
         sys.exit("no readable logs")
 
+    # Several runs of one map/arm -- a 500k and a 1M budget, or a repeated seed -- would
+    # otherwise land under identical column headings. Disambiguate by step budget first
+    # (that is the difference that matters), then by a seed counter for true repeats.
+    counts: dict[str, int] = {}
+    for name, _ in runs:
+        counts[name] = counts.get(name, 0) + 1
+    repeats: dict[str, int] = {}
+    for i, (name, data) in enumerate(runs):
+        if counts[name] < 2:
+            continue
+        last = data.get("last step")
+        budget = f"@{round(int(last) / 1000):d}k" if last and last.isdigit() else ""
+        repeats[name] = repeats.get(name, 0) + 1
+        runs[i] = (f"{name}{budget}#{repeats[name]}", data)
+
     keys = [k for k in ORDER if any(k in d for _, d in runs)]
     keys += [k for k in SIMPLE if any(k in d for _, d in runs)]
     keys += ["average wall-clock time per optimal step",

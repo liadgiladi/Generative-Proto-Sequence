@@ -76,7 +76,7 @@ if [ "${LENGTH_WEIGHT}" != "0" ]; then
                  --min_lengths_per_head 4 --max_lengths_per_head 10)
 fi
 
-echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS} ==="
+echo "=== J1: map=${MAP}  length_weight=${LENGTH_WEIGHT}  train_pairs=${TRAIN_PAIRS}  total_steps=${TOTAL_STEPS} ==="
 
 START=$(date +%s)
 
