@@ -124,8 +124,11 @@ def main() -> None:
     z_random = torch.randn(n, cfg.actor_n_output_channels, device=device)
 
     # Freshly initialised decoder: the control. Per §6.4 this should be healthy.
+    # .to(device) matters: z_random is built on `device` above, and the trained decoder gets
+    # moved on load below, but this one never was -- so under --cuda the control sat on the
+    # CPU and greedy_decode raised a device mismatch. Only CPU runs worked.
     untrained = build_decoder()
-    untrained.model.eval()
+    untrained.model.to(device).eval()
     describe("untrained decoder (control)", greedy_decode(untrained, z_random), n)
 
     trained = build_decoder()

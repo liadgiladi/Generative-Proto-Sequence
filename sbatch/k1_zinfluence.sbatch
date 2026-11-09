@@ -38,6 +38,11 @@ source activate gps_env
 RUN="$1"
 MAP="$2"
 N_SAMPLES="${3:-256}"
+# Must match the run being probed. check_z_influence.py inherits Config, whose default is
+# 100 -- so without this it probes the actor on states drawn from a 100-pair dataset while
+# the checkpoint was trained on 500. Comparisons between two such runs are still internally
+# consistent, but the probe distribution is not the training distribution.
+TRAIN_PAIRS="${4:-500}"
 
 if [ -z "${RUN}" ] || [ -z "${MAP}" ]; then
     echo "ERROR: pass a run and its map, e.g."
@@ -58,10 +63,11 @@ if [ ! -d "${RUN_DIR}" ]; then
     exit 1
 fi
 
-echo "=== K1: run_dir=${RUN_DIR}  map=${MAP}  n_samples=${N_SAMPLES} ==="
+echo "=== K1: run_dir=${RUN_DIR}  map=${MAP}  n_samples=${N_SAMPLES}  train_pairs=${TRAIN_PAIRS} ==="
 
 poetry run python check_z_influence.py \
     --run_dir "${RUN_DIR}" \
     --cuda \
     --obstacle_map "${MAP}" \
+    --train_dataset_size "${TRAIN_PAIRS}" \
     --n_samples "${N_SAMPLES}"
