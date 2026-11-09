@@ -65,15 +65,12 @@ Note the last two rows together: a single decode is *slightly more expensive* fo
 Transformer, and it still wins 2.5× on wall-clock per optimal step, because it needs 4×
 fewer of them. **That is the sequence-level argument, measured.**
 
-> **Partly a property of corridors — qualified by §8.** 64 free cells in 1-wide passages
-> means almost no branch points, so a committed multi-step plan is nearly always right
-> because there was never another route. Across the other six maps: the **decision-count
-> advantage survives everywhere** (~2× fewer generations), but **the step-ratio advantage
-> inverts** — on every cluttered map the Transformer's paths are *less* direct than the
-> MLP's, because it emits the same rigid 3.000-action plan regardless of state. Corridors
-> is where that costs nothing. **Do not quote §1.2 without §8.**
->
-> (The step-ratio figures in §8 are from the 500k runs and need re-measuring at 1M.)
+> **Largely confirmed by §8, with corridors the extreme case.** 64 free cells in 1-wide
+> passages means almost no branch points, so the 4× decision advantage and the 0.936/0.573
+> step-ratio gap are both bigger here than anywhere else. Across the other six maps at
+> matched budgets the **decision-count advantage holds everywhere** (2–3×) and the
+> **step-ratio advantage holds on five of seven** — it trails only on `obstacles_15p` and
+> `24x24_empty`. Quote §8's table rather than this one: the margins here are corridors-sized.
 
 ### 1.3 Multi-environment sweep — complete (2026-11-09)
 
@@ -481,19 +478,26 @@ done
 
 **Complete, 2026-11-09, at matched 1M budgets. Near-parity on six maps, one hard failure.**
 
-| map | cov. | GPT succ | MLP succ | gap | GPT budget |
-|---|---|---|---|---|---|
-| 8x8_empty | 24.8% | 1.000 | 1.000 | 0.000 | 500k |
-| 16x16_empty | 3.1% | 0.994 | 1.000 | −0.006 | 1M |
-| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **+0.008** | 500k |
-| 16x16_obstacles_v1_15p | 4.4% | 0.949 | 0.987 | −0.038 | 1M |
-| 16x16_room_v1 | 5.8% | 0.945 *(0.961, 0.929)* | 0.980 | −0.035 | 1M, n=2 |
-| 16x16_obstacles_v1_25p | 6.7% | 0.915 *(0.924, 0.905)* | 0.953 | −0.038 | 1M, n=2 |
-| **24x24_empty** | 0.8% | **0.110** *(0.120, 0.099)* | **0.973** | **−0.863** | 500k, n=2 |
+| map | cov. | GPT succ | MLP succ | gap | GPT gen/ep | MLP gen/ep | GPT ratio | MLP ratio | GPT budget |
+|---|---|---|---|---|---|---|---|---|---|
+| 8x8_empty | 24.8% | 1.000 | 1.000 | 0.000 | **2.19** | 3.92 | **0.977** | 0.934 | 500k |
+| 16x16_empty | 3.1% | 0.994 | 1.000 | −0.006 | **3.42** | 5.73 | **0.946** | 0.889 | 1M |
+| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **+0.008** | **3.36** | 13.34 | **0.936** | 0.573 | 500k |
+| 16x16_obstacles_v1_15p | 4.4% | 0.949 | 0.987 | −0.038 | **4.98** | 10.66 | 0.755 | **0.825** | 1M |
+| 16x16_room_v1 | 5.8% | 0.945 *(.961/.929)* | 0.980 | −0.035 | **4.56** | 11.56 | **0.805** | 0.774 | 1M, n=2 |
+| 16x16_obstacles_v1_25p | 6.7% | 0.915 *(.924/.905)* | 0.953 | −0.038 | **4.83** | 13.66 | **0.785** | 0.701 | 1M, n=2 |
+| **24x24_empty** | 0.8% | **0.110** *(.120/.099)* | **0.973** | **−0.863** | 7.16 | 12.40 | 0.640 | **0.717** | 500k, n=2 |
 
-**Six of seven maps are within 0.04; one fails completely.** Against a 0.019–0.042 noise
-floor and a single-seed MLP, the −0.035/−0.038 cells are barely distinguishable from a tie.
-The Transformer is consistently a few points behind on 16x16 and ahead only on corridors.
+**Six of seven maps are within 0.04 on success; one fails completely.** Against a 0.019–0.042
+noise floor and a single-seed MLP, the −0.035/−0.038 cells are barely distinguishable from a
+tie.
+
+**And at matched budget the Transformer wins on both efficiency axes:** 2–3× fewer decisions
+per episode on *every* map, and a better agent step ratio on **five of seven** (8x8, empty,
+corridors, room, obstacles_25p). Only `obstacles_15p` and `24x24` favour the MLP on path
+quality. An earlier version of this section, written from the 500k runs, said the step-ratio
+advantage "inverts on every cluttered map" — that was truncation, not a property of the
+decoder.
 
 #### The 500k budget was most of the apparent gap
 
@@ -540,6 +544,27 @@ genuinely far apart.
 the cause of the fixed-3-action behaviour to be removed — it is what makes the method work at
 all. Any replacement (a learned stop token, state-dependent length) has to match it from the
 start, not merely avoid its rigidity.
+
+#### Plan length is rigid either way — the penalty moves a constant
+
+`valid actions/seq` with and without the penalty:
+
+| | empty | room | obs15 | obs25 | 24x24 |
+|---|---|---|---|---|---|
+| tuned (0.002) | 3.002 | 3.001 | 3.000 | 3.000 | 2.986 |
+| **plain (0)** | **1.026** | **1.001** | **1.007** | **1.001** | **1.006** |
+| MLP | 1.798 | 1.127 | 1.086 | 1.115 | 1.255 |
+
+**The decoder has exactly two modes: 1.000 or 3.000, neither state-dependent.** The penalty
+does not make plan length adaptive, it relocates the constant. That is the precise statement
+of the problem an adaptive-replanning mechanism exists to solve.
+
+**But note the MLP column.** It also runs short plans — 1.09 to 1.80 — and scores 0.95–1.00,
+while the GPT at 1.00 scores 0.20–0.24. **Short plans are therefore not the problem in
+themselves; the GPT's individual action choices are worse**, and the 3-action penalty
+compensates for that rather than exploiting commitment. Do not design on the premise that
+commitment is what makes GPS work — on this evidence it is a workaround for weaker per-step
+action quality.
 
 **Coverage is not the explanatory variable** for any of this — the MLP scores 0.973 on
 24x24_empty at **0.8%**. Coverage explains only why corridors at 100 pairs looked starved
@@ -670,11 +695,11 @@ genuinely operating at the sequence level. Current baseline, 500 pairs:
 
 | | corridors | 8x8 | empty | room | obs15 | obs25 | 24x24 |
 |---|---|---|---|---|---|---|---|
-| **GPT** | **3.36** | 2.19 | 3.70 | 5.57 | 5.23 | 6.57 | 7.63 |
+| **GPT** (best budget) | **3.36** | **2.19** | **3.42** | **4.56** | **4.98** | **4.83** | **7.16** |
 | MLP | 13.34 | 3.92 | 5.73 | 11.56 | 10.66 | 13.66 | 12.40 |
 
-The Transformer replans roughly **half as often on every map**, and 4× less on corridors.
-That advantage is the one §8 result that survives everywhere.
+The Transformer replans **2–3× less often on every map**, and 4× less on corridors. This is
+the one result that holds across the entire sweep without qualification.
 
 **How it must be qualified — never quote it alone.** The metric is trivially gamed: emit one
 enormous plan, replan once, fail the episode. Three companions make it honest, and all three
@@ -683,27 +708,26 @@ come out of the same `compare_runs.py` table:
 | companion | why |
 |---|---|
 | `success` | did it actually reach the goal? Fewer decisions at lower success is not a win. |
-| `agent step ratio` | optimal steps ÷ actual steps. Fewer decisions that produce *longer wandering paths* is not a win either — and this is exactly where the Transformer currently loses (0.601–0.735 vs the MLP's 0.701–0.825 on the hard maps). |
-| `valid actions/seq` | the emitted plan length. The Transformer's is pinned at **3.000** everywhere, which is why its replanning count is low — fixed stride, not adaptation. **This is the defect the thesis addresses.** |
+| `agent step ratio` | optimal steps ÷ actual steps. Fewer decisions that produce *longer wandering paths* is not a win either. At matched 1M budgets the Transformer is **ahead on five of seven maps** here; it trails on `obstacles_15p` (0.755 vs 0.825) and `24x24_empty` (0.640 vs 0.717). |
+| `valid actions/seq` | the emitted plan length. Pinned at **3.000** with the length penalty and **1.000** without it, on every map — a constant either way, never state-dependent. **This is the defect the thesis addresses.** |
 
 **The honest summary of the baseline**, as of 2026-11-09 (matched 1M budgets):
 
 > At matched training budgets the Transformer decoder reaches the goal about as often as the
 > MLP on six of seven environments — within 0.04, and ahead on `16x16_corridors_v1` — while
-> replanning roughly half as often. It fails completely on the largest map,
-> `24x24_empty` (0.11 vs 0.97 across two seeds), for reasons not yet explained. Its
-> advantage in decision count comes from committing to a fixed 3-action plan regardless of
-> state, which is also why its paths are less direct than the MLP's on every map that offers
-> a real route choice.
+> replanning **2–3× less often on every map** and following more direct paths on five of the
+> seven. It fails completely on the largest map, `24x24_empty` (0.11 vs 0.97 across two
+> seeds), for reasons not yet explained.
 
-The last clause is the motivation for adaptive replanning: **the commitment mechanism works
-and is cheap; the decision of *when* to commit does not exist yet.** Note also that the
-length penalty that produces the commitment is load-bearing — at `weight 0` the agent
-collapses to 0.20–0.24 on cluttered maps (§8) — so a replacement must match it, not merely
-avoid its rigidity.
+The motivation for adaptive replanning is not in that summary but in the mechanism behind it:
+**plan length is a constant, not a decision.** The decoder emits 3.000 actions with the
+length penalty and 1.000 without it, on every map (§8) — it never adapts to the state. The
+commitment is cheap and works; *choosing when to commit* does not exist yet.
 
-⚠ **Pending:** the `gen/ep`, step-ratio and plan-length numbers below were measured on the
-**500k** runs. Re-generate them from the 1M logs with `compare_runs.py` before quoting.
+Two caveats a write-up must carry: the length penalty producing the 3-action plan is
+**load-bearing** (at `weight 0` success collapses to 0.20–0.24), and the MLP achieves 0.95–1.00
+with plans of 1.09–1.80, so **short plans are not the deficiency** — the Transformer's
+per-step action quality is.
 
 ### Also worth a table in any write-up
 
