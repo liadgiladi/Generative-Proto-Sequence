@@ -177,9 +177,20 @@ def main() -> None:
     sims = normalized @ normalized.T
     off_diagonal = sims[~torch.eye(sims.shape[0], dtype=torch.bool, device=device)]
 
+    # std discriminates where cosine does not: a working 16x16_room_v1 checkpoint (0.961) and
+    # a failing 24x24_empty one (0.099) differ by 0.011 in cosine and by 2.8x in std. But std
+    # is NOT scale-invariant, so a small value is ambiguous between "less diversity" and
+    # "smaller z overall" -- and the two have different fixes (actor-side vs scaling z_proj).
+    # The norm and the ratio below separate them: a low std with a proportionally low norm is
+    # a magnitude effect; a low std at a normal norm is genuine collapse.
+    std = z_actor.std(dim=0).mean().item()
+    norm = z_actor.norm(p=2, dim=1).mean().item()
+
     print(f"actor z: mean pairwise cosine similarity = {off_diagonal.mean().item():.4f} "
           f"(1.0 = all identical)")
-    print(f"actor z: std across embedding dims       = {z_actor.std(dim=0).mean().item():.4f}")
+    print(f"actor z: std across embedding dims       = {std:.4f}")
+    print(f"actor z: mean L2 norm                    = {norm:.4f}")
+    print(f"actor z: std / norm (scale-free spread)  = {std / norm if norm else float('nan'):.5f}")
     describe("sequences from actor z (trained decoder)",
              greedy_decode(trained, z_actor), z_actor.shape[0])
 
@@ -195,6 +206,12 @@ def main() -> None:
     print("Part A fine, Part B similarity -> the ACTOR collapsed; it emits one embedding.")
     print("  near 1.0 / few sequences        Fix: --diversity_weight (it acts on the")
     print("                                  actor's head embeddings), more exploration.")
+    print("  BUT judge this on std/norm,     cosine barely moved between a 0.961 and a 0.099")
+    print("  not on cosine:                  checkpoint (0.764 vs 0.775) while std differed")
+    print("                                  2.8x (0.0271 vs 0.0097).")
+    print("    low std + low norm         -> magnitude, not diversity. Scale z_proj (sec 6.4)")
+    print("                                  or LayerNorm z; actor-side fixes miss the point.")
+    print("    low std + normal norm      -> genuine collapse; actor-side.")
     print("Both fine                      -> diversity is lost elsewhere; look at critic")
     print("                                  selection among candidates.")
 

@@ -35,6 +35,12 @@
 module load anaconda
 source activate gps_env
 
+# check_z_influence.py inherits Config, where torch_deterministic defaults to True, and
+# set_seed then calls torch.use_deterministic_algorithms(True). Under --cuda that raises
+# unless cuBLAS has a workspace config. Every other sbatch here exports it; this one did not,
+# which is why both GPU attempts died at the first greedy_decode.
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 RUN="$1"
 MAP="$2"
 N_SAMPLES="${3:-256}"

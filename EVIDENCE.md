@@ -207,6 +207,7 @@ Each of these cost real time. Check them before trusting a measurement.
 |---|---|
 | **`mean cosine similarity all pairs`** (logged) | Reduces the **head** axis of a `(batch, n_heads, embed)` tensor, not the embedding axis. At 1 head it degenerates to sign agreement; at 5 heads it measures something else. **Only comparable between runs with the same head count.** Use **`actor/embedding_cosine`** (added later) or `check_z_influence.py`. |
 | **`actor/embedding_cosine`** — even the correct one | A **mechanism signal, not a performance proxy.** D2 and D3 both roughly halved it (0.337 / 0.375 vs a 0.641 control) and scored 0.691 and **0.445** — opposite directions. Forcing actor diversity can cost you 0.17. Never judge a config on this alone. |
+| **Cosine barely moves when the actor *does* differ** | A 0.961 checkpoint and a 0.099 checkpoint of the same config differ by **0.011** in actor cosine (0.7639 vs 0.7746) — indistinguishable — while `std across embedding dims` differs **2.8×** (0.0271 vs 0.0097), which is the quantity that tracks the failure (§8). Every actor diagnosis in §4 and wave D was read off cosine. **Prefer `std / norm`**, which `check_z_influence.py` now prints: cosine is scale-free but insensitive, raw `std` is sensitive but confounded by `z` magnitude, and the ratio is both. |
 | **`max_qf_value`** | Dead config unless `min_qf_value` is also set — the clip is gated on it being non-`None`. It was never active in *any* run in this repo, including the 0.794 MLP baseline. |
 | **`--sequence_length_weight` / `--invalid_actions_weight`** | Were no-ops: `compute_sequence_lengths_differentiable` ended in `torch.floor`, which has zero gradient, so the penalties were logged and could not influence training. **Fixed** — and removing that one line is what produced A3's +0.15. |
 | **wandb TEST columns showing `-`** | The final test metrics log under `test-eval-with-critic/*`; the columns usually displayed are the **periodic** `test-eval-with-critic-<step>/*`, which our configs disable via `--eval_test_dataset_during_training_freq -1`. Also, before the fix, final metrics were written with no step and dropped entirely. Runs before that fix have empty columns — their numbers are in the slurm logs. |
@@ -408,11 +409,16 @@ failure, and the length penalty confirmed load-bearing rather than harmful.
 
 1. **Re-generate the sequence-level metrics from the 1M logs.** §8 and §9's `gen/ep`, step
    ratio and plan-length figures are all from the 500k runs. One `compare_runs.py` call.
-2. **Diagnose `24x24_empty`.** The only cell where the decoders are genuinely far apart
-   (0.110 vs 0.973, n=2, not truncation, not coverage, not the penalty). Start with
-   `check_z_influence.py` on a 24x24 checkpoint — actor collapse there would look exactly
-   like this, and 484 free cells is 2.5× the observation area the actor's CNN was tuned on.
-   Nothing else should be built on top of an unexplained total failure.
+2. **`24x24_empty` — diagnosed, one step from a fix.** The decoder is healthy there; the
+   actor's `z` is 2.8× narrower than on a working map, and the actor reaches only 23% of the
+   decoder's plan range against room's 43% (§8). Two things left, both cheap:
+   - **re-run `check_z_influence.py` on both checkpoints** and read the new `std / norm`
+     line. Low `std` *with* a low norm → scale `z_proj` (§6.4) or LayerNorm `z`, a
+     decoder-side one-liner. Low `std` at a normal norm → genuine collapse, actor-side.
+   - **add a Part-B-only mode** so the same probe runs against an MLP-tree checkpoint. That
+     answers whether the actor narrows because the map is large or because the Transformer
+     passes it a weaker gradient (§4(b)) — i.e. whether this is a map problem or a decoder
+     problem.
 3. **Then the thesis: make plan length state-dependent.** A policy that commits to 3 actions
    whether it is in a corridor or a cluttered room is doing fixed-stride, not sequence-level,
    decision making. Candidates: a learned stop token, per-state length conditioning, or
@@ -525,8 +531,44 @@ seed peaked at 295k and then declined, so a longer budget will not help. Ruled o
 - **not the length penalty** — the `weight 0` arm scores 0.141, equally bad
 
 Something specific to the Transformer breaks on the 484-free-cell map while the MLP is
-unaffected. **This is the open question**, and the only cell where the two decoders are
-genuinely far apart.
+unaffected — it is the only cell where the two decoders are genuinely far apart.
+
+**Diagnosed** by `check_z_influence.py` against a working checkpoint of the same config
+(`unique-snow-60`, room_v1, 0.961) vs the failing one (`sunny-galaxy-68`, 0.099), both at
+500 pairs:
+
+| | room_v1 (0.961) | 24x24 (0.099) |
+|---|---|---|
+| Part A trained, unique trimmed (random `z`) | 60/256 | **64/256** |
+| actor cosine | 0.7639 | 0.7746 |
+| **actor `z`: std across dims** | **0.0271** | **0.0097** |
+| plans from actor `z`, unique trimmed | 26/256 | 15/256 |
+
+**The decoder is healthy on the failing map — marginally healthier than on the working one.**
+64 distinct trimmed plans from random `z` vs room's 60. The decoder is not the cause.
+
+**The actor's `z` is 2.8× narrower**, and the consequence is how much of the decoder's range
+the actor actually reaches: room **26/60 = 43%**, 24x24 **15/64 = 23%**. Fifteen distinct
+plans cannot cover 484 free cells; on corridors' 64 cells they can. That is the failure.
+
+**Two readings, not yet separated** — `std` is not scale-invariant:
+
+- **smaller-magnitude `z`** → decoder-side and cheap. `z_proj`'s init std (§6.4,
+  `1/√16 ≈ 0.25`) is explicitly a tunable knob; a LayerNorm on `z` before projection would
+  also make a small `z` still move the residual stream.
+- **genuinely less diversity** → actor-side, and a poor road: §9.9 showed forcing actor
+  diversity can cost 0.17.
+
+`check_z_influence.py` now prints `mean L2 norm` and `std / norm` to tell them apart — a low
+`std` with a proportionally low norm is magnitude, a low `std` at a normal norm is collapse.
+**Re-run both checkpoints to read those two lines; it decides which fix applies.**
+
+**Still open: is the narrowing caused by the map or by the Transformer?** The MLP's actor on
+24x24 may be perfectly wide — its decoder maps `z` → all 50 logits in one linear layer and
+passes a stronger gradient back (§4(b): actor grad norm 0.387 vs 0.197–0.265). Testing it
+needs Part B against an MLP-tree checkpoint, which will not load here because the decoder
+`state_dict` keys differ; it needs a Part-B-only mode. That decides whether the problem is
+"large maps" or "the Transformer starves its own actor."
 
 #### The length penalty is load-bearing
 
