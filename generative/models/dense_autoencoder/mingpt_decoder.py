@@ -426,7 +426,13 @@ class GPT(nn.Module):
         """Advance cached decoding by one token.
 
         Args:
-            tokens: integer token ids ``(B,)`` or ``(B, 1)`` chosen at the previous step.
+            tokens: either integer token ids ``(B,)`` / ``(B, 1)`` chosen at the previous
+                step, or a float distribution over the vocabulary ``(B, vocab_size)``.
+                The float form multiplies the embedding table rather than indexing it,
+                which keeps this step differentiable with respect to whatever produced the
+                distribution -- see ``ActionGen``'s soft-token-feedback path. For a
+                one-hot row the two are mathematically identical; only the backward pass
+                differs.
             past_key_values: cache from the previous ``init_decode`` / ``decode_step``.
             position: absolute position of ``tokens`` (prefix is at 0, so the first real
                 token is at position 1).
@@ -435,7 +441,11 @@ class GPT(nn.Module):
         Returns:
             ``(logits, past)`` with logits ``(B, vocab_size)`` predicting the next token.
         """
-        token_embeddings = self.tok_emb(tokens.view(-1, 1))  # (B, 1, n_embd)
+        if tokens.is_floating_point():
+            # (B, vocab) @ (vocab, n_embd) -> (B, 1, n_embd)
+            token_embeddings = (tokens @ self.tok_emb.weight).unsqueeze(1)
+        else:
+            token_embeddings = self.tok_emb(tokens.view(-1, 1))  # (B, 1, n_embd)
         logits, past = self._forward_trunk(
             token_embeddings,
             position_offset=position,

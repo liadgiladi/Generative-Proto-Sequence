@@ -1,5 +1,10 @@
 # Transformer Decoder Integration
 
+> **Picking up this work?** Start with [`EVIDENCE.md`](../../../EVIDENCE.md) at the
+> repository root — current results, methodology, and the metrics and flags that silently
+> lie or do nothing. This file is the full chronological record; `EVIDENCE.md` is the
+> orientation layer.
+
 Replacing the VAE's single-shot MLP decoder with a minimal, latent-conditioned causal
 Transformer (minGPT-style) and migrating the surrounding mechanics from a flattened
 one-hot representation to integer-token autoregressive modeling.
@@ -8,7 +13,15 @@ Files touched:
 - **New:** [mingpt_decoder.py](mingpt_decoder.py)
 - **Changed:** [dense_var_auto_encoder_vin_1.py](dense_var_auto_encoder_vin_1.py)
 - **Changed:** [decoder_utils.py](decoder_utils.py)
-- **Changed:** [gps_simplegrid_levels.py](../../../gps_simplegrid_levels.py) (§7)
+- **Changed:** [gps_simplegrid_levels.py](../../../gps_simplegrid_levels.py) (§7, §8)
+
+Tooling added for the §7–§8 investigations, all at the repository root:
+- `bench_decoder.py` — per-call decoder microbenchmark (§7.2)
+- `eval_checkpoint.py` — run the test evaluation against saved checkpoints, for runs that
+  died before reaching their own (§8.1)
+- `check_z_influence.py` — separate actor collapse from decoder collapse (§8.3)
+- `sbatch/` — the experiment matrix (`e0`–`e8` runtime, `a1`–`a3`/`b2` accuracy), plus
+  `sbatch/_common.sh` and `sbatch/eval_checkpoint.sbatch`
 
 ---
 
@@ -465,3 +478,607 @@ measured with both bugs active and must be re-run before it means anything.
 For calibration when reading the new runs: at 30k steps (3% of a run) E3/E8 reached 0.25–0.27
 val success with 1.24–1.41 valid actions per sequence. Per §6.5's own recalibration, ~1.6 is
 normal for this task even for the 0.794 MLP, so short sequences are **not** a collapse signal.
+
+**Resolved in §8:** the fixed code measures 0.432–0.488 test success — parity with the 0.509
+GPT run, not an improvement. §8 has the diagnosis.
+
+---
+
+## 8. Accuracy investigation (round 3)
+
+### 8.1 Three more correctness bugs
+
+All pre-existing, all found by runs dying rather than by review.
+
+| bug | symptom | fix |
+|---|---|---|
+| A non-finite gradient `return`ed out of `train()` | Run exits 0, reports "Finished", **no test evaluation at all** despite good checkpoints on disk (job 22379903, step 625476) | Set `continue_training = False` and unwind to the end of `train()`, which still runs the test evaluation. Optimizer steps are still skipped, so NaN gradients never reach the weights. |
+| The actor-diversity logging block assigned to `action_list_batch` | `AttributeError: 'NoneType' object has no attribute 'argmax'` (job 22379902, step 650000 = 13 x 50000) | It calls `gen_action_seq` without `get_actions_as_one_hot`, which returns `(None, probs)`, clobbering the acting loop's variable. If an episode ended on that same step the verbose logger crashed. Now uses local names. Intermittent: needs a multiple of `evaluate_actor_diversity_every_k_epochs` *and* an episode ending on it. |
+| `eval_with_pretrained_model` never reloaded the decoder | Test success 0.056 with `valid actions per sequence = 10.0` (a decoder that never emits EOS) | It loads actor and critic from the best-on-validation checkpoint but used the *live* decoder object. Invisible with a frozen pretrained decoder; under `--train_decoder_end_to_end` it paired a best-on-validation actor with a decoder from ~600k steps later. Now loads the matching `decoder` checkpoint and restores the caller's in a `finally` (the function also runs mid-training). |
+
+`eval_checkpoint.py` + `sbatch/eval_checkpoint.sbatch` were added to recover test numbers from
+runs that died before their final evaluation — minutes against checkpoints already on disk,
+versus re-running for hours.
+
+### 8.2 Measured accuracy after §7.1
+
+| run | test success (stochastic) | deterministic inference |
+|---|---|---|
+| `earthy-bird-16` (deterministic) | 0.432 | 0.329 |
+| `true-capybara-17` (non-deterministic) | 0.488 | 0.381 |
+| **prior GPT run (`eager-lion-9`)** | **0.509** | — |
+| **MLP baseline** | **~0.794** | — |
+
+**The §7.1 fixes did not improve accuracy.** At n=1000, SE ≈ 0.016, so 0.488 is
+indistinguishable from 0.509 while 0.432 is genuinely below it.
+
+Two calibration points for every future experiment:
+
+- **Run-to-run variance is ~0.05** (0.432 vs 0.488 on the same config bar determinism), so
+  anything under that is noise.
+- **Deterministic inference costs ~0.1** in both runs. `deterministic_inference` defaults to
+  `True`, so the deterministic pass is the pessimistic number; both are printed.
+
+The 0.794 MLP run's summary shows `gradient/decoder_norm: 1255`, which means **§7.1.1's
+accumulating-gradient bug was active in the MLP baseline too**. The bug applied to whichever
+decoder was plugged in, so it cannot explain the architecture gap.
+
+### 8.3 Diagnosis: the actor collapsed, not the decoder
+
+`sequences/num_unique` collapses monotonically in the GPT runs while the MLP baseline
+sustains ~40.8. That metric is end-to-end (observation → actor → `z` → decoded sequence), so
+it cannot say which half failed — and the two halves have opposite fixes. `check_z_influence.py`
+separates them, offline, from saved checkpoints.
+
+Measured on `earthy-bird-16`, 256 samples:
+
+```
+PART A -- decoder, fed random z
+  untrained decoder (control)    unique(trimmed)=20/256   mean_len=3.06
+  trained decoder                unique(trimmed)=44/256   mean_len=1.77
+
+PART B -- actor, fed real observations
+  mean pairwise cosine similarity = 0.7783   (1.0 = all identical)
+  std across embedding dims       = 0.0133
+  sequences from actor z          unique(trimmed)=5/256   mean_len=1.01
+```
+
+**The decoder is healthy** — more z-responsive after training than at initialisation (44 vs
+20 unique). **The actor collapsed**: near-constant embeddings landing in a region of `z`-space
+that decodes to single-action plans. Five distinct outputs across 256 states.
+
+**The method has degenerated into a 1-step policy.** Generate a multi-action plan and let the
+critic choose among candidates has become "emit one action at a time" through an elaborate
+actor → `z` → decoder pipeline. It also explains the ~20 decoder generations per episode seen
+throughout §7. A length-1 plan is a sensible local optimum: it cannot commit to a wrong
+multi-step move, so the critic prefers it.
+
+### 8.4 `sequence_length_weight` was a no-op
+
+`compute_sequence_lengths_differentiable` ended with `lengths = torch.floor(lengths)`.
+`floor` has zero gradient everywhere, so the function — whose name states its purpose —
+returned a constant with respect to the parameters. Both consumers (`sequence_length_weight`
+and `invalid_actions_weight`) add their penalty to `actor_loss`, so those terms were **logged
+but contributed no gradient** and could not influence training. The floor is removed.
+
+### 8.5 Experiments
+
+All at `--total_timesteps 500000` (validation peaks ~305k and declines, so the second half
+only costs time) and `--no-torch_deterministic` (1.71x faster; these are exploratory).
+Baseline to beat: **0.488**. Noise floor: **~0.05**.
+
+| | config | targets |
+|---|---|---|
+| `sbatch/a1_multihead.sbatch` | `--n_proto_plan_candidates 5` | `n_proto_plan_candidates` defaults to 1, which makes candidate selection, `sample_from_candidates` and the per-head softmax weighting all no-ops. The five-element `min_lengths_per_head` defaults imply 5 was intended. Control for A2/A3. |
+| `sbatch/a2_diversity.sbatch` | A1 + `--diversity_weight 0.1` | the 0.7783 cosine similarity. `compute_diversity_loss_with_normalized_embeddings` acts on the **actor's head embeddings**, so it needs >1 head to have pairs at all. |
+| `sbatch/a3_length.sbatch` | A1 + `--sequence_length_weight 1e-4` | `mean_len = 1.01`, head-on. Per-head bands `[1,2,4,6,8]` force plans longer and heads apart. Only works because of §8.4. |
+
+**Result — all three were worse, and all destabilised. See §8.8.**
+
+| run | best val | best step | outcome |
+|---|---|---|---|
+| baseline (1 candidate) | **0.53** | **305,000** | — |
+| A1 (5 candidates) | 0.37 | 60,000 | NaN crash at 3:25 |
+| A2 (5 + diversity) | 0.44 | 60,000 | NaN crash at 2:35 |
+| A3 (5 + length) | 0.43 | 60,000 | NaN crash at 3:19 |
+
+Each peaked at step 60,000 and then degraded for ~250k steps before dying. These measured
+instability, not the mechanism — **multi-head remains untested, not refuted.**
+
+### 8.6 Open: forward response vs backward gradient
+
+Part A tested whether the decoder responds to `z` in the **forward** direction. It says
+nothing about **gradient quality in the backward** direction, and those are different
+properties. So the actor's collapse may still be *caused* by the decoder:
+
+- **(a) The actor was never the problem.** The MLP maps `z` → all 50 logits in one linear
+  layer, so near-identical `z` still perturbs all 10 positions and yields different
+  sequences. The GPT's autoregressive chain washes small `z` differences out against
+  accumulating token history. Fix would be decoder-side.
+- **(b) The MLP passed a stronger gradient to the actor.** Its path is critic → one Gumbel →
+  one linear → `z`. The GPT's is critic → Gumbel at 10 steps → through the trunk each time →
+  `z_proj` → `z`, with fed-back tokens **detached**. A weaker signal makes "emit a constant
+  safe `z`" attractive. Consistent with actor gradient norms: MLP 0.387 vs GPT 0.197–0.265.
+
+Under (b) the fix is **soft token feedback** — `row @ tok_emb.weight` instead of
+`tok_emb(argmax(row).detach())`. With `hard=True` Gumbel the forward pass is numerically
+identical (`row` is one-hot), but gradients then flow through the whole chain to `z`.
+
+**Resolved — and no new code was needed.** The training loop already logs this metric
+(`mean cosine similarity all pairs`, over the target actor's embeddings on a batch of
+next-states), so the answer was in the old logs all along:
+
+| | MLP (job 18136376, 0.794) | GPT (job 22379902, 0.432) |
+|---|---|---|
+| actor cosine, **early → late** | **1.0 → 0.507** | **0.706 → 0.619** |
+| plan length (over *unique* sequences) | 3.67 | 3.17 |
+| end-to-end unique sequences | **41.0** | **17.5** |
+
+**The trajectory is the finding, not the endpoint.** The MLP's actor started *fully
+collapsed* — cosine 1.0, one embedding for every state — and learned down to 0.507. Ours
+started better (0.706) and barely moved (0.619). The MLP's actor learned; ours did not.
+
+That points at the learning signal rather than the starting point, i.e. explanation **(b)**,
+and matches the actor gradient norms (MLP 0.387 vs GPT 0.197–0.265).
+
+**Correction to §8.3's phrasing.** "Degenerated into a 1-step policy" is right in practice
+but was stated too strongly. `mean_len = 1.01` (from `check_z_influence.py`) averages over
+**all 256 states**; the log's `mean length action sequences: 3.17` averages over the
+**unique** sequences only. Both are true: nearly every state receives a 1-action plan, while
+the ~17 distinct plans that exist average 3.17 actions. The decoder *can* produce long plans
+— the actor almost never asks for one.
+
+### 8.7 B2 — soft token feedback  (`--decoder_soft_token_feedback`)
+
+The fix implied by (b). `ActionGen._generate` fed the next step a **detached argmax index**,
+so gradient reached `z` only through the prefix token; the 10-step chain was a gradient dead
+end. With the flag, the emitted row is fed back directly and `GPT.decode_step` multiplies the
+embedding table instead of indexing it:
+
+```python
+token_embeddings = (tokens @ self.tok_emb.weight).unsqueeze(1)   # float row
+token_embeddings = self.tok_emb(tokens.view(-1, 1))              # integer index
+```
+
+For a one-hot row these are mathematically identical, so **generation is unchanged — only the
+backward pass differs.** Applied only to the hard-one-hot emission modes (`gumbel`,
+`straight_through`, `argmax`): the scaled-probs row is a temperature-0.01 softmax, not a
+one-hot, so feeding it back would change what the model generates rather than only how
+gradients flow.
+
+Default off, so it is A/B-able. `sbatch/b2_soft_feedback.sbatch` runs it at **one** proto-plan
+candidate with no other regulariser, making it a single-variable comparison against the
+0.53-val / 0.432-test baseline. (It was originally written with 5 candidates; see §8.8 for
+why that was wrong.)
+
+**Risk:** a 10-step differentiable chain is less stable than a 1-step one, and both full runs
+already hit NaN gradients. Watch `gradient/decoder_norm` and `gradient/actor_norm`. Per §8.1
+a NaN abort now still produces a final test evaluation, so an instability yields a number
+rather than nothing.
+
+---
+
+## 9. Maximisation bias, and a brake that was never connected (round 4)
+
+### 9.1 Why A1–A3 all destabilised
+
+All three died the same way, 2.5–3.5h in:
+
+```
+RuntimeError: probability tensor contains either `inf`, `nan` or element < 0
+  in select_action
+```
+
+The critic had produced **NaN Q-values**, and `torch.multinomial` refuses them. The crash
+site is itself diagnostic: with `n_proto_plan_candidates=1`, `batch_q_stack.shape == (1, 1)`
+takes the `q_idx = tensor([0])` branch and `multinomial` is **never reached**. That branch
+had been dead in every previous run; 5 candidates made it live.
+
+**The cause is the Bellman target:**
+
+```python
+qf_next_target = qf_next_target.view(cfg.batch_size, cfg.n_proto_plan_candidates)
+best_candidate_indices = torch.argmax(qf_next_target, dim=1)      # max over candidates
+qf_next_target = qf_next_target[range(cfg.batch_size), best_candidate_indices]
+```
+
+With 1 candidate that `argmax` is a no-op. With 5 it takes the maximum of five noisy
+estimates — textbook **maximisation bias**. The inflated value becomes the training target,
+the critic learns to predict higher, and it compounds until Q diverges to NaN. Hence the
+peak at step 60,000 followed by 250k steps of decay.
+
+### 9.2 `max_qf_value` has never been applied
+
+The standard defence already exists in the code and has never run:
+
+```python
+if cfg.min_qf_value is not None:
+    qf1_a_values = torch.clip(qf1_a_values, min=cfg.min_qf_value, max=cfg.max_qf_value)
+```
+
+`min_qf_value` defaults to `None`, so the clip is skipped and **`max_qf_value = 1.0` is dead
+config** — in every run in this document, including the MLP baseline. Episodic returns span
+roughly −20 to +1, so `--min_qf_value -20.0 --max_qf_value 1.0` activates it.
+
+Worth enabling even at one candidate: both 1-candidate full runs also reached NaN gradients
+(steps 625,476 and 918,000). Five candidates accelerate the divergence; they do not create it.
+
+### 9.3 `select_action` now survives non-finite Q
+
+A NaN there killed three 3-hour runs outright, and because they crashed they never ran their
+final evaluation — the numbers in §8.5 had to be recovered from log greps. `select_action`
+now falls back to candidate 0 with a warning. This fixes nothing; it means an instability
+still yields a result, like the §8.1 abort.
+
+### 9.4 Revised experiments — back to one candidate
+
+A1 and A2 are shelved: A1 *is* the multi-candidate change, and the diversity loss compares
+pairs of actor heads, so at one head the term is identically zero. Both need the §9.2 clip
+before they are worth retrying.
+
+| | config | note |
+|---|---|---|
+| `sbatch/a3_length.sbatch` | 1 candidate, `--sequence_length_weight 5e-4`, band `4`–`10`, `--min_qf_value -20.0` | Single-element length bands because the penalty asserts `len(min_lengths_per_head) == n_proto_plan_candidates`. Weight raised from 1e-4 since the sum is now over 256 terms, not 1280. |
+| `sbatch/b2_soft_feedback.sbatch` | 1 candidate, `--decoder_soft_token_feedback`, `--min_qf_value -20.0` | Single variable against the 0.53-val baseline. |
+
+### 9.5 Result — the length penalty works
+
+| run | test (stochastic) | test (deterministic) | best val | best step | hours |
+|---|---|---|---|---|---|
+| baseline, deterministic, 1M | 0.432 | 0.329 | 0.49 | 330,000 | 11.29 |
+| baseline, non-deterministic, 1M | 0.403 | 0.318 | 0.45 | 355,000 | 7.62 |
+| **A3 — length penalty, 500k** | **0.582** | **0.511** | **0.61** | 265,000 | 4.26 |
+| B2 — soft feedback, 500k | 0.479 | 0.400 | 0.55 | 225,000 | 5.50 |
+| *prior GPT run (`eager-lion-9`)* | *0.509* | — | — | — | — |
+| *MLP baseline* | *0.794* | — | — | — | — |
+
+**A3 is the first GPT configuration to beat the 0.509 prior run** — by 4.6 SE (n=1000,
+SE ≈ 0.016) — and it beats the fixed baseline by 0.15, three times the ~0.05 run-to-run
+noise floor. Even its pessimistic deterministic-inference number (0.511) edges past the old
+stochastic 0.509. It closes roughly **40%** of the gap between the fixed GPT baseline and
+the MLP.
+
+**The win came from deleting one line.** §8.4 removed `torch.floor` from
+`compute_sequence_lengths_differentiable`; that was the only reason
+`--sequence_length_weight` could affect training at all. The diagnosis in §8.3 predicted
+the fix — the actor almost never asks for a long plan — and the fix delivered.
+
+**B2 (0.479) is unproven**: above the 0.432 baseline, but inside the noise band.
+
+Caveats: A3 is one run at one seed, and it ran 500k steps against the baseline's 1M (best
+val arrived at 265k, so it was not cut short). Still well below the MLP's 0.794.
+
+### 9.6 Logging fixes
+
+**The final test metrics never reached wandb.** `eval_with_pretrained_model` logs them with
+`c_writer.add_scalar(tag, value)` and no step, so tensorboard records them at step 0 — but
+by then the run's counter is at `total_timesteps`, and `sync_tensorboard` requires
+non-decreasing steps, so they were dropped. The headline numbers existed only in the slurm
+logs, which is why every result in §8–§9 was recovered by grepping. They are now mirrored
+into `wandb.run.summary`, which is step-independent and surfaces as columns
+(`test-eval-with-critic/mean_episodic_success` and the `-deterministic` variant).
+
+**A correct actor-embedding metric.** The logged `mean cosine similarity all pairs` reduces
+`dim=2` of a `(batch, n_heads, embedding_dim)` tensor — the **head** axis, not the embedding
+axis. At `n_heads=1` the vectors have length 1 and cosine degenerates to sign agreement; at
+`n_heads=5` it measures something else entirely, which is why A2 reported 0.952 against a
+1-head baseline of 0.619. The original is kept unchanged so the §8.6 trajectory stays
+readable in its own units, and **`actor/embedding_cosine`** is added alongside: pairwise
+cosine between per-state head-0 embeddings, reduced over the embedding axis, self-pairs
+excluded. That matches what `check_z_influence.py` reports (0.7783 on `earthy-bird-16`) and
+is comparable across head counts.
+
+### 9.7 Wave D — three experiments against A3
+
+A3 is now the control: it is the best configuration, so improvements stack on it rather
+than on a baseline already beaten. Each run changes exactly one thing.
+
+| | config | question |
+|---|---|---|
+| `sbatch/d1_a3_repeat.sbatch` | A3 unchanged | Is 0.582 real? `--no-torch_deterministic` makes this an independent sample without a seed change. |
+| `sbatch/d2_a3_soft_feedback.sbatch` | A3 + `--decoder_soft_token_feedback` | Does soft feedback pay off once plans are long enough to have a chain worth differentiating? B2 alone was noise, but on length-1 plans (`mean_len = 1.01`) there is barely a chain for it to act on. |
+| `sbatch/d3_a3_actor_lr.sbatch` | A3 + `--actor_learning_rate 3e-4` | Cheapest test of the weak-gradient theory: the actor's gradient norm was 0.197–0.265 vs the MLP's 0.387. If the signal is simply ~2x too small, this compensates. |
+| `sbatch/d4_a3_stronger_length.sbatch` | A3 + `--sequence_length_weight 2e-3` (4×) | §9.8 shows the penalty is under-powered — `mean_len` settled at 2.53 against a band asking for ≥4. Does pushing further keep paying? |
+
+### 9.8 How A3 actually won — and what it did *not* fix
+
+`check_z_influence.py` on A3's checkpoint (`kind-bush-24`) against the baseline
+(`earthy-bird-16`), 256 samples each:
+
+| | baseline (0.432) | **A3 (0.582)** | change |
+|---|---|---|---|
+| **mean_len from actor `z`** | 1.01 | **2.53** | **+150%** |
+| **unique plans from actor `z`** | 5/256 | **17/256** | **3.4×** |
+| actor embedding cosine | 0.7783 | 0.7892 | unchanged |
+| decoder on *random* `z` (unique / mean_len) | 44 / 1.77 | 47 / 1.99 | barely moved |
+| `invalid - empty action sequence` | 12 | 3 | fewer |
+
+**The penalty did what it was designed to do, and the score tracks the mechanism** — plans
+more than doubled in length and 3.4× more distinct plans reach execution.
+
+**But the actor did not become more state-dependent.** Cosine moved 0.778 → 0.789, i.e.
+nowhere. Note the asymmetry between the two halves of the measurement: Part A (random `z`)
+barely moved while Part B (actor `z`) moved a lot. Training only reshapes the region the
+actor actually visits. So A3's win came from **the decoder learning to spread the actor's
+narrow `z`-region across longer, more varied plans** — not from repairing the actor.
+
+**The §8.3 actor collapse is therefore still fully intact**, and every actor-targeted lever
+(diversity, learning rate, soft feedback) remains genuinely unexplored in terms of moving
+that number. D2 and D3 are the first tests of it.
+
+**And the penalty is under-powered.** `mean_len` equilibrated at 2.53 against a band asking
+for ≥ 4 — the Q term pushes back and the balance settled below target. D4 raises the weight
+4× to find out whether the lever has more to give.
+
+One reason that is not a formality: §6.5 records the MLP baseline at ~1.6 valid actions per
+sequence, and A3 is already at 2.53. Longer is not obviously monotonically better — there
+may be an optimum nearby or already passed.
+
+### 9.9 Wave D results
+
+| config | seeds | mean |
+|---|---|---|
+| baseline | 0.432, 0.403 | 0.418 |
+| B2 — soft feedback **alone** | 0.479, 0.481 | 0.480 |
+| **A3 — length penalty** | 0.582, 0.611, 0.665 | **0.619** |
+| **D2 — A3 + soft feedback** | **0.691** | — (1 seed) |
+| D3 — A3 + actor lr 3e-4 | 0.445 | — (1 seed) |
+| *MLP baseline* | *0.794* | — |
+
+**The noise floor is ~0.042, not 0.03.** Three A3 seeds (0.582 / 0.611 / 0.665) give a
+sample std of 0.042, so a 2σ result needs roughly **+0.084** over the 0.619 mean. The
+earlier 0.03 figure came from a deterministic/non-deterministic pair, which differ in more
+than seed.
+
+#### D3 is refuted, and it invalidates the metric we were tracking
+
+`actor/embedding_cosine` over matched sample indices (every 5000 steps):
+
+| sample (≈steps) | 5 (25k) | 10 (50k) | 17 (85k) | 25 (125k) | 35 (175k) | 44 (220k) |
+|---|---|---|---|---|---|---|
+| D1 (A3 control) | 0.687 | 0.743 | 0.701 | 0.656 | 0.623 | 0.641 |
+| D2 (soft feedback) | 0.794 | 0.762 | 0.629 | 0.421 | 0.363 | **0.337** |
+| D3 (actor lr) | 0.825 | 0.782 | 0.555 | 0.373 | 0.339 | **0.375** |
+
+D1 is flat — the actor barely learns, exactly the §8.3 collapse, and consistent with A3
+leaving it untouched (0.778 → 0.789 in §9.8). D2 and D3 both diverge from the control
+around 50–85k steps and end at roughly **half** its value. The first interventions to move
+the actor at all.
+
+**And they went in opposite directions on success: 0.691 vs 0.445.**
+
+So **`actor/embedding_cosine` is a mechanism signal, not a performance proxy.** You can
+halve it and lose 0.17. D3 — simply taking larger actor steps — achieves the diversity and
+damages the agent. Actor collapse is real and diagnosable, but *forcing* diversity is not
+the fix, and any future experiment judged on that metric alone will mislead.
+
+#### D2 composes with A3, which is the result worth chasing
+
+- soft feedback **alone** (B2, 2 seeds): 0.480 — *worse* than A3
+- soft feedback **on top of A3** (D2, 1 seed): 0.691 — best so far
+
+That is precisely what D2 was built to test. Gradient flowing through the decode chain has
+almost nothing to work with when plans are length 1 (`mean_len = 1.01` on the baseline);
+A3 is what makes them long. The two mechanisms appear to compose rather than overlap.
+
+**Confirmed by D5** (second seed): 0.691 and 0.675, mean **0.683**, spread 0.016. Welch's t
+against A3's three seeds gives t ≈ 2.5 — a real gain of +0.064.
+
+### 9.10 Final wave D results — the length weight is the dominant lever
+
+| config | seeds | mean | vs previous |
+|---|---|---|---|
+| baseline | 0.432, 0.403 | 0.418 | — |
+| B2 — soft feedback **alone** | 0.479, 0.481 | 0.480 | worse than A3 |
+| A3 — length 5e-4 | 0.582, 0.611, 0.665 | 0.619 | +0.20 over baseline |
+| D2 — A3 + soft feedback | 0.691, 0.675 | 0.683 | +0.064 |
+| **D4/D6 — length 2e-3** | **0.741, 0.709** | **0.725** | **+0.106 over A3** |
+| D7 — length 2e-3 + soft feedback | 0.734 | — | +0.009 — **noise** |
+| D8 — length 4e-3 | 0.742 | — | +0.017 — **noise** |
+| *MLP target* | *0.794* | *(1 seed)* | |
+
+Noise floor **0.042 (1σ)**, from A3's three seeds.
+
+**The length penalty is the dominant lever, and it has plateaued.** The weight sweep reads
+5e-4 → 0.619, 2e-3 → 0.725, 4e-3 → 0.742; the last step is inside the noise. D4 at 2e-3 is
+the operating point.
+
+**Soft feedback and the length penalty overlap — they do not compose.** Its contribution
+shrank as the penalty strengthened:
+
+- on A3 (5e-4): 0.619 → 0.683, **+0.064**
+- on D4 (2e-3): 0.725 → 0.734, **+0.009**
+
+Which is what the mechanism predicts. Soft feedback lets gradient flow through the decode
+chain, and that is worth something when plans are long enough to have a chain worth
+differentiating — but worthless once a stronger penalty has already forced them long. Two
+routes to the same improvement, not two independent ones. Only testing the combination
+revealed it; assuming additivity would have predicted ~0.805.
+
+**Status: ~0.725–0.742 against the MLP's 0.794** — a gap of ~0.06, about 1.5σ, and the MLP
+is a single seed. The configurations are no longer clearly distinguishable.
+
+**The cheap levers are exhausted.** D7 and D8 both demonstrate that more knob-turning will
+not close the remainder. The one substantial untried option is **reconstruction
+pretraining** (§6.5): the decoder has never been shown an action sequence, having been
+asked to learn sequence structure from sparse RL reward alone — which is the hardest
+possible way to train a sequence model and throws away the Transformer's actual advantage.
+Blocked on the §4.1–4.3 standalone-loop fixes.
+
+**Best-known configuration** (`sbatch/d6_d4_repeat.sbatch`):
+
+```
+--n_proto_plan_candidates 1 --min_qf_value -20.0 --max_qf_value 1.0
+--sequence_length_weight 0.002 --min_lengths_per_head 4 --max_lengths_per_head 10
+--total_timesteps 500000 --no-torch_deterministic --decoder_use_cuda_graph
+```
+
+~4.3 h on a `gtx_1080`, against the 50.3 h / 0.509 run this investigation started from.
+
+Read against A3's 0.582 with a 0.05 noise floor, so a real win clears ~0.63. Watch
+`actor/embedding_cosine` as well as the score — movement there is the mechanism signal,
+independent of success rate.
+
+**Parked, with reasons:**
+
+- **Multi-head** — genuinely untested rather than refuted (§9.1). Worth one retry now that
+  `--min_qf_value` exists, but after wave D.
+- **`z` at every position** — would strengthen conditioning, but §8.3 Part A already shows
+  the decoder responds well to `z` (44 unique sequences from 256 random `z`, better than
+  untrained). It reinforces something that works.
+- **`--include_actor_embedding_in_critic_input`** (direct `dQ/dz`) — needs two fixes first:
+  four call sites unpack 5 values from `DenseVAE.forward`, which returns 4; and those calls
+  encode sub-sequences with the VAE encoder, which receives no gradient in from-scratch E2E
+  runs, so the stored `z` would be noise from a random encoder. It also carries a design
+  risk: with `z` in the critic's input the actor can raise Q by moving `z` without the
+  decoded sequence improving.
+- **Reconstruction pretraining** — the highest-ceiling option and §6.5's own recommendation:
+  it attacks the real difficulty, a from-scratch autoregressive model learning sequence
+  structure from sparse reward, and would train the encoder the item above needs. Blocked on
+  the §4.1–4.3 standalone-loop fixes.
+
+> ⚠️ **§9.10's closing status is superseded by §10.** "~0.725–0.742 against the MLP's 0.794,
+> a gap of ~0.06" describes `16x16_corridors_v1` at 100 training pairs. Both halves of that
+> turned out to be unrepresentative: the gap is a data artifact (§10.1), and corridors is the
+> one map of seven where the Transformer is competitive at all (§10.3).
+
+---
+
+## 10. The data regime, and the multi-environment sweep (round 5)
+
+Everything in §6–§9 was measured on **one map at 100 training pairs**. Round 5 varied both,
+and both turned out to matter more than any architectural change tried in §6–§9.
+
+### 10.1 The corridors gap was data starvation, not architecture
+
+`--train_dataset_size` defaults to 100, matching the paper's protocol. Raising it:
+
+| training pairs | GPT (tuned) | MLP | gap |
+|---|---|---|---|
+| 100 | 0.725 ± 0.018 (n=5) | 0.794 | −0.069 |
+| 300 | 0.897 (`g1`) | — | — |
+| **500** | **0.990** (`g2`) | **0.982** (`h1`) | **+0.008** |
+
+The 0.069 gap that §8–§9 spent two waves of experiments on **closes completely at 500
+pairs.** Every symptom §8.3 diagnosed — the actor collapse, `mean_len = 1.01`, the 200k
+stall, the 0.17 train/val gap — is a symptom of overfitting 100 pairs on one map.
+
+Capacity (§4 F1/F2), multi-head, and further length/soft-feedback tuning were all aimed at
+that gap and are closed accordingly.
+
+**But read coverage, not the pair count.** `16x16_corridors_v1` is a maze of 1-wide passages
+with only **64 free cells**, so its level-1–14 train pool is 1,778 pairs and 500 of them is
+**28% of the entire reachable space**. The same flag buys 5.8% on `16x16_room_v1` and 3.1%
+on `16x16_empty`. See §10.5.
+
+### 10.2 Sequence-level metrics at tied success — on corridors
+
+With success tied at ~0.99, `compare_runs.py` (new, repo root) pulls the rest of the paper's
+metric set. `g2` vs `h1`, both 500 pairs:
+
+| | GPT | MLP |
+|---|---|---|
+| success | 0.990 | 0.982 |
+| **decoder generations/ep** | **3.36** | 13.34 |
+| **agent step ratio** | **0.936** | 0.573 |
+| actions/ep | 10.1 | 25.1 |
+| revisits (global) | 0.12 | 1.94 |
+| wall-clock / optimal step | **0.0041 s** | 0.0102 s |
+| inference / decision | 0.0029 s | 0.0025 s |
+
+A single decode is *slightly more expensive* for the Transformer and it still wins 2.5× on
+wall-clock per optimal step, because it needs 4× fewer. **This result does not survive
+§10.3** — it is a property of corridors.
+
+### 10.3 The multi-environment sweep — the conclusion reverses
+
+`sbatch/j1_gpt_map.sbatch` (Transformer) and `j2_mlp_map.sbatch` (MLP, run against the
+unmodified paper tree at `6f627a2`), 500 pairs, all seven maps the repo ships. The paper
+evaluates 9; both 24x24 obstacle maps are absent here.
+
+| map | coverage | **GPT** | **MLP** | gap | GPT best-val step |
+|---|---|---|---|---|---|
+| 16x16_corridors_v1 | 28.1% | 0.990 | 0.982 | **+0.008** | ~200k |
+| 8x8_empty | 24.8% | 1.000 | 1.000 | 0.000 | 425,000 |
+| 16x16_empty | 3.1% | 0.990 | 1.000 | −0.010 | 425,000 |
+| 16x16_room_v1 | 5.8% | 0.838 | 0.980 | −0.142 | **499,999** ⚠ |
+| 16x16_obstacles_v1_15p | 4.4% | 0.824 | 0.987 | −0.163 | 470,000 ⚠ |
+| 16x16_obstacles_v1_25p | 6.7% | 0.505 | 0.953 | −0.448 | **499,999** ⚠ |
+| 24x24_empty | 0.8% | 0.120 | 0.973 | −0.853 | 295,000 |
+
+**The MLP sits at 0.95–1.00 on every map. Corridors is the single map where the Transformer
+wins, and it is the map this entire investigation ran on.**
+
+Coverage does **not** order this table — the MLP reaches 0.973 on 24x24_empty at 0.8%
+coverage. Neither decoder is coverage-limited in this range.
+
+⚠ **Three GPT runs were truncated.** `--total_timesteps 500000` was validated on corridors,
+where validation peaks ~200k. On room and obstacles_25p the best validation is at step
+**499,999** — still improving at the budget wall — and obstacles_15p at 470,000. Those three
+gaps are upper bounds. `j1` now takes `total_steps` as a 4th argument; 1M re-runs are in
+flight. 24x24 is **not** truncated (peak 295k, then decline) — that one is a real failure.
+
+### 10.4 The mechanism — a fixed 3-action plan
+
+`valid actions/seq` (despite the name, this is `len(actions)`, the emitted plan length —
+`gps_simplegrid_levels.py:609`):
+
+| | 8x8 | empty | room | obs15 | obs25 | 24x24 |
+|---|---|---|---|---|---|---|
+| **GPT** | 3.003 | 3.002 | **3.000** | **3.000** | **3.000** | **3.000** |
+| MLP | 1.638 | 1.798 | 1.127 | 1.086 | 1.115 | 1.255 |
+
+**Exactly 3.000 across four structurally different maps is a degenerate policy, not
+adaptation** — and the length bands ask for 4–10. The Transformer emits the same fixed-stride
+commitment everywhere, corridors included (3.01 there).
+
+On corridors a blind multi-step commitment is nearly free: 1-wide passages have almost no
+branch points, so a committed plan is right because there was never another route. On maps
+with real route choice it is wrong, and the cost shows in every derived metric:
+
+| | room | obs15 | obs25 | 24x24 |
+|---|---|---|---|---|
+| step ratio, GPT vs MLP | 0.735 / **0.774** | 0.705 / **0.825** | 0.636 / **0.701** | 0.601 / **0.717** |
+| revisits (global), GPT vs MLP | 1.158 / **0.746** | 0.959 / **0.464** | 1.385 / **1.291** | 2.117 / **1.203** |
+
+The §10.2 decision-count advantage *does* survive — roughly half the generations per episode
+on every map — but here it buys worse paths and lower success, where on corridors it bought
+both.
+
+**Open:** whether the rigidity is caused by `--sequence_length_weight`, the lever §9.10
+identified as dominant and tuned on corridors. `j1 <map> 0` arms are running on all five
+non-trivial maps to find out. If plan length varies by map without the penalty, the
+regulariser is the problem; if it stays at 3.000, the rigidity is in the decoder or actor.
+
+### 10.5 Measurement traps found in this round
+
+| trap | what happens |
+|---|---|
+| **`grep -m1` on an MLP log** | `j2` does not pass `--eval_test_dataset_during_training_freq -1`, so MLP logs contain **many** `test dataset with critic mean success:` lines — the periodic evaluations — and the final one is last, not first. A `-m1` grep over the sweep returned 0.12–0.33 where the true finals were 0.95–1.00, **inverting the conclusion**. Use `compare_runs.py` (takes the last match) or `\| tail -1`. |
+| **`--train_dataset_size` across maps** | An absolute count over pools that differ by orders of magnitude. 500 pairs = 28.1% of corridors' train pool, 5.8% of room_v1's, 3.1% of 16x16_empty's, 0.8% of 24x24_empty's. Not a controlled comparison; quote coverage. |
+| **`max_level` (default 14)** | Caps **every** map at 14-step optimal paths, so no map in this repo tests long horizons. 24x24_empty is short paths on a large canvas (diameter 46, only 46% of its pairs usable), not a longer horizon. A horizon-scaling experiment needs `max_level` raised per map, which changes the pool too. |
+| **1.0 success on 8x8** | Not leakage — `simplegrid_dataset.py` partitions each level disjointly. Saturation: 8x8_empty's diameter *is* 14, so levels 1–14 is the whole map and 500 pairs is a quarter of it. 8x8 success carries no information. |
+
+### 10.6 Status
+
+**Runtime: resolved** (§7). 50.3 h → 3–7 h per 500k run depending on the map.
+
+**Accuracy: the Transformer decoder is not competitive with the MLP off corridors.** Six of
+seven maps favour the MLP, three of those by truncated margins pending the 1M re-runs. The
+proximate cause is named and measurable: a fixed 3.000-action plan regardless of state.
+
+**What a fix would have to look like.** A policy that commits to 3 actions whether it is in
+a corridor or a cluttered room is doing fixed-stride, not sequence-level, decision making.
+Candidates, in rough order of cost: a learned stop token; per-state length conditioning;
+letting the critic choose among candidate plans of differing length (needs
+`n_proto_plan_candidates > 1`, which needs §9.2's clip — now available). **Reconstruction
+pretraining** (§6.5, §9.10) remains the highest-ceiling option but addresses sequence
+*quality*, not the length rigidity §10.4 identifies as binding.
+
+**A note on GPS itself, held loosely.** The winning arm plans 1.1–1.8 actions ahead — close
+to single-step control, and close to the "collapse" §8.3 diagnosed as *our* pathology. That
+makes "does sequence-level decision making beat a 1-step agent here?" an open question this
+comparison cannot answer, because both arms are GPS. `dqn_simplegrid_levels.py` is already in
+the repo and `sbatch/j3_dqn_map.sbatch` runs it at a matched 1M environment-step budget
+(both scripts increment `global_step` per environment step). `temporl_` and `dar_` are the
+two temporal-abstraction baselines to add after it.

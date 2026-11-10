@@ -10,7 +10,8 @@ class ActionGen:
 
     def __init__(self, pretrained_decoder: DenseVAE, n_act_seq_len: int, device: torch.device, maze_n_actions: int = 4,
                  use_gumble: bool = True, penalize_cyclic_position_revisits: bool = False,
-                 deterministic_inference: bool = True, use_cuda_graph: bool = False):
+                 deterministic_inference: bool = True, use_cuda_graph: bool = False,
+                 soft_token_feedback: bool = False):
         self.n_words = maze_n_actions + 1
         self.n_action_seq_length = n_act_seq_len
         self.model = pretrained_decoder
@@ -24,6 +25,15 @@ class ActionGen:
         # issues ~550 tiny kernels per call and is ~100% dispatch overhead at our sizes
         # (measured: batch 1 and batch 256 cost the same to within 1%), so replaying it as
         # a single captured graph is worth ~8x at batch 1 and ~2x at batch 256.
+        # Feed the emitted (one-hot) row back into the next decode step instead of a
+        # detached argmax index, so gradient flows through the whole 10-step chain rather
+        # than reaching z only via the prefix token. Generation is unchanged -- for a
+        # one-hot row, row @ tok_emb.weight == tok_emb(argmax) -- so this alters the
+        # backward pass only. Motivated by the actor failing to learn state-dependent
+        # embeddings (cosine 0.706 -> 0.619 over a full run, where the MLP decoder's actor
+        # went 1.0 -> 0.507); see TRANSFORMER_INTEGRATION.md §8.6.
+        self.soft_token_feedback = soft_token_feedback
+
         self.use_cuda_graph = use_cuda_graph
         # Keyed by (batch_size, emit mode): the training loop only uses a handful of
         # shapes, and a graph is bound to exactly one.
@@ -108,16 +118,23 @@ class ActionGen:
         # the right switch: it is off for action selection, the target-Q computation and
         # evaluation (all of which dominate the call count), and on for the actor update,
         # which must stay eager so gradients still reach z and the decoder parameters.
+        # Soft feedback only applies to the hard-one-hot emission modes. The scaled-probs
+        # row is a temperature-0.01 softmax, not a one-hot, so feeding it back would change
+        # what the model generates rather than only how gradients flow.
+        soft_feedback = self.soft_token_feedback and emit_key in (
+            "gumbel", "straight_through", "argmax"
+        )
+
         if self.use_cuda_graph and z.is_cuda and not torch.is_grad_enabled():
-            sequence = self._generate_graphed(z, step_emit, emit_key)
+            sequence = self._generate_graphed(z, step_emit, emit_key, soft_feedback)
         else:
-            sequence = self._generate(z, step_emit)
+            sequence = self._generate(z, step_emit, soft_feedback)
 
         if not get_actions_as_one_hot:
             return None, sequence
         return sequence, None
 
-    def _generate(self, z: torch.Tensor, step_emit) -> torch.Tensor:
+    def _generate(self, z: torch.Tensor, step_emit, soft_feedback: bool = False) -> torch.Tensor:
         """Autoregressive generation loop (KV-cached).
 
         ``init_decode`` processes the z-prefix once and returns both the logits predicting
@@ -135,16 +152,26 @@ class ActionGen:
             generated_rows.append(row)
 
             if t < self.n_action_seq_length - 1:
-                # Condition the next step on the token we just produced (greedy w.r.t. the
-                # emitted row, detached so no gradient flows through the discrete choice).
-                next_token = torch.argmax(row, dim=-1).detach()  # (batch,)
+                if soft_feedback:
+                    # Feed the emitted row itself. For the hard-one-hot emission modes the
+                    # forward pass is unchanged (row @ tok_emb.weight == tok_emb(argmax)),
+                    # but gradient now flows back through every step of the chain instead
+                    # of stopping at the detach below -- so the critic's signal reaches z
+                    # through all 10 positions rather than only through the prefix token.
+                    next_input = row
+                else:
+                    # Condition the next step on the token we just produced (greedy w.r.t.
+                    # the emitted row, detached so no gradient flows through the discrete
+                    # choice).
+                    next_input = torch.argmax(row, dim=-1).detach()  # (batch,)
                 step_logits, past = self.model.decoder.decode_step(
-                    next_token, past, position=t + 1, use_cache=True
+                    next_input, past, position=t + 1, use_cache=True
                 )
 
         return torch.stack(generated_rows, dim=1)
 
-    def _generate_graphed(self, z: torch.Tensor, step_emit, emit_key: str) -> torch.Tensor:
+    def _generate_graphed(self, z: torch.Tensor, step_emit, emit_key: str,
+                          soft_feedback: bool = False) -> torch.Tensor:
         """Run ``_generate`` by replaying a captured CUDA graph.
 
         Capture records the concrete kernel sequence, so the KV cache's growing
@@ -166,12 +193,12 @@ class ActionGen:
 
         if entry is None:
             try:
-                entry = self._capture_graph(z, step_emit)
+                entry = self._capture_graph(z, step_emit, soft_feedback)
             except Exception as exc:  # pragma: no cover - depends on driver/GPU support
                 print(f"[GPS] CUDA graph capture failed ({exc}); falling back to eager "
                       f"decoding for the rest of this run.", flush=True)
                 self.use_cuda_graph = False
-                return self._generate(z, step_emit)
+                return self._generate(z, step_emit, soft_feedback)
             self._graph_cache[key] = entry
             print(f"[GPS] captured decoder CUDA graph for batch={key[0]} emit={key[1]}",
                   flush=True)
@@ -185,7 +212,7 @@ class ActionGen:
         # copy rather than the live buffer.
         return static_out.clone()
 
-    def _capture_graph(self, z: torch.Tensor, step_emit):
+    def _capture_graph(self, z: torch.Tensor, step_emit, soft_feedback: bool = False):
         """Warm up and capture one (batch size, emit mode) variant of the decode loop."""
         static_z = z.detach().clone()
 
@@ -195,12 +222,12 @@ class ActionGen:
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(3):
-                self._generate(static_z, step_emit)
+                self._generate(static_z, step_emit, soft_feedback)
         torch.cuda.current_stream().wait_stream(side)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            static_out = self._generate(static_z, step_emit)
+            static_out = self._generate(static_z, step_emit, soft_feedback)
 
         return static_z, graph, static_out
 
@@ -346,7 +373,8 @@ def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch
                     deterministic_inference: bool = False, load_pretrained_weights: bool = True,
                     decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
                     decoder_dropout: Optional[float] = None,
-                    decoder_use_cuda_graph: bool = False) -> ActionGen:
+                    decoder_use_cuda_graph: bool = False,
+                    decoder_soft_token_feedback: bool = False) -> ActionGen:
     decoder = get_decoder(decoder_f_name=decoder_model_path, decoder_seq_len=decoder_seq_len, device=device,
                           maze_n_actions=maze_n_actions, var_for_sample=var_for_sample,
                           load_pretrained_weights=load_pretrained_weights,
@@ -356,7 +384,8 @@ def get_decoder_api(decoder_model_path: str, decoder_seq_len: int, device: torch
                      maze_n_actions=maze_n_actions, use_gumble=use_gumble_in_decoder,
                      penalize_cyclic_position_revisits=penalize_cyclic_position_revisits,
                      deterministic_inference=deterministic_inference,
-                     use_cuda_graph=decoder_use_cuda_graph)
+                     use_cuda_graph=decoder_use_cuda_graph,
+                     soft_token_feedback=decoder_soft_token_feedback)
 
 
 def get_decoder(decoder_f_name: str, decoder_seq_len: int, device: torch.device, maze_n_actions: int,

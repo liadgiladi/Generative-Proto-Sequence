@@ -235,6 +235,15 @@ class Config:
     """whether to use batch normalization in the actor's linear layers"""
     actor_weight_decay: float = 1e-4
     """the weight decay for the actor's network"""
+    actor_grad_clip: float = 0.0
+    """if > 0, clip the global gradient norm of the actor (and, in end-to-end mode, the
+       decoder) to this value before stepping. Off by default. Typical actor gradient norms
+       are 0.2-0.4, so a clip around 1.0 only bites on spikes. Motivated by two runs that
+       destabilised the *actor* specifically: a larger decoder (n_layer 3 / n_embd 64)
+       NaN'd at step 159k with the NaN appearing in cnn.0.weight, and actor_learning_rate
+       3e-4 scored 0.445. Both amplify what reaches the actor. Note this is preventive, not
+       curative: clipping cannot repair a gradient that is already NaN, it only limits the
+       growth that leads there"""
     pe_embedding_dim: int = 128
     """the embedding dimension of the position encoding for concatenation with the CNN output in the actor network. Set to -1 to disable position encoding."""
     exclude_decoder_from_computation_graph: bool = False
@@ -289,6 +298,13 @@ class Config:
        tiny kernels per call and is almost entirely dispatch overhead, so this is worth
        ~8x at batch 1 and ~2x at batch 256. The actor update stays eager so gradients
        still flow. Requires CUDA; falls back to eager with a warning if capture fails"""
+    decoder_soft_token_feedback: bool = False
+    """feed the emitted one-hot row back into the next decode step instead of a detached
+       argmax index. Generation is unchanged (for a one-hot row, row @ tok_emb.weight ==
+       tok_emb(argmax)); only the backward pass differs, letting the critic's gradient
+       reach z through all 10 positions rather than only the prefix token. Aimed at the
+       actor failing to learn state-dependent embeddings -- see §8.6 of
+       TRANSFORMER_INTEGRATION.md. Only applies to the one-hot emission modes"""
     use_gumble_in_decoder: bool = True
     """
     If True, the decoder's `gen_action_seq` function uses the Gumbel-Softmax method, which preserves gradients for backpropagation.
@@ -1105,21 +1121,48 @@ def eval_test_dataset(test_dataset: list[tuple[PositionXY, PositionXY, int]],
             for idx, agent_step_ratio in enumerate(episodic_avg_agent_step_ratio_in_sequences):
                 c_writer.add_scalar(f"{c_tag_name}/episodic_agent_step_ratio", agent_step_ratio, idx)
 
-        c_writer.add_scalar(f"{c_tag_name}/mean_episodic_return", np.round(np.mean(episodic_returns), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_episodic_success", np.round(np.mean(episodic_successes), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_decoder_generations", np.round(np.mean(episodic_num_decoder_generations), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_valid_actions_per_sequence_in_episode", np.round(np.mean(episodic_avg_valid_actions_in_sequences), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_unused_actions_per_sequence_in_episode", np.round(np.mean(episodic_avg_unused_actions_in_sequences), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_agent_step_ratio_per_sequence_in_episode", np.round(np.mean(episodic_avg_agent_step_ratio_in_sequences), 3))
-        
-        # Add timing statistics to logs (successful episodes only)
-        c_writer.add_scalar(f"{c_tag_name}/avg_wall_clock_time_per_optimal_step", timing_stats['avg_wall_clock_time_per_optimal_step'])
-        c_writer.add_scalar(f"{c_tag_name}/std_wall_clock_time_per_optimal_step", timing_stats['std_wall_clock_time_per_optimal_step'])
-        c_writer.add_scalar(f"{c_tag_name}/avg_inference_time_per_decision_successful", timing_stats['avg_inference_time_per_decision_successful'])
-        c_writer.add_scalar(f"{c_tag_name}/std_inference_time_per_decision_successful", timing_stats['std_inference_time_per_decision_successful'])
-        c_writer.add_scalar(f"{c_tag_name}/total_episodes", timing_stats['total_episodes'])
-        c_writer.add_scalar(f"{c_tag_name}/successful_episodes", timing_stats['successful_episodes'])
-        c_writer.add_scalar(f"{c_tag_name}/total_decisions_successful", timing_stats['total_decisions_successful'])
+        test_metrics = {
+            f"{c_tag_name}/mean_episodic_return": np.round(np.mean(episodic_returns), 3),
+            f"{c_tag_name}/mean_episodic_success": np.round(np.mean(episodic_successes), 3),
+            f"{c_tag_name}/mean_num_decoder_generations": np.round(np.mean(episodic_num_decoder_generations), 3),
+            f"{c_tag_name}/mean_num_valid_actions_per_sequence_in_episode": np.round(np.mean(episodic_avg_valid_actions_in_sequences), 3),
+            f"{c_tag_name}/mean_num_unused_actions_per_sequence_in_episode": np.round(np.mean(episodic_avg_unused_actions_in_sequences), 3),
+            f"{c_tag_name}/mean_agent_step_ratio_per_sequence_in_episode": np.round(np.mean(episodic_avg_agent_step_ratio_in_sequences), 3),
+            # Timing statistics (successful episodes only)
+            f"{c_tag_name}/avg_wall_clock_time_per_optimal_step": timing_stats['avg_wall_clock_time_per_optimal_step'],
+            f"{c_tag_name}/std_wall_clock_time_per_optimal_step": timing_stats['std_wall_clock_time_per_optimal_step'],
+            f"{c_tag_name}/avg_inference_time_per_decision_successful": timing_stats['avg_inference_time_per_decision_successful'],
+            f"{c_tag_name}/std_inference_time_per_decision_successful": timing_stats['std_inference_time_per_decision_successful'],
+            f"{c_tag_name}/total_episodes": timing_stats['total_episodes'],
+            f"{c_tag_name}/successful_episodes": timing_stats['successful_episodes'],
+            f"{c_tag_name}/total_decisions_successful": timing_stats['total_decisions_successful'],
+        }
+
+        for metric_name, metric_value in test_metrics.items():
+            c_writer.add_scalar(metric_name, metric_value)
+
+        # Mirror the same numbers into wandb's run summary.
+        #
+        # The add_scalar calls above pass no step, so tensorboard records them at step 0 --
+        # but by the time the final test evaluation runs, the run's step counter is at
+        # total_timesteps. wandb requires non-decreasing steps when syncing tensorboard, so
+        # these land behind the run and never appear as columns: the headline test numbers
+        # were only ever readable by grepping the slurm log.
+        #
+        # Summary values carry no step, so they surface directly in the runs table. Keys
+        # are identical to the tensorboard tags, e.g.
+        #   test-eval-with-critic/mean_episodic_success
+        #   test-eval-with-critic-deterministic/mean_episodic_success
+        if c_cfg.track:
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.run.summary.update(
+                        {k: float(v) for k, v in test_metrics.items()}
+                    )
+            except Exception as exc:  # pragma: no cover - logging must not break evaluation
+                print(f"[GPS] (wandb summary update skipped: {exc})", flush=True)
 
         if len(all_env_eval_stats) > 0:
             writer.add_scalar(
@@ -1281,8 +1324,17 @@ def eval_candidates_with_critic(action_list_batch: torch.Tensor, action_list_pro
 
 def select_action(action_list_batch: torch.Tensor, action_list_proba_batch: torch.Tensor, batch_q_stack, cfg: Config, rng_sample_from_candidates: random.Random) -> \
 tuple[torch.Tensor, torch.Tensor]:
+    # A non-finite Q value makes both branches below fail -- torch.multinomial raises
+    # "probability tensor contains either `inf`, `nan` or element < 0" outright, which
+    # killed three 3-hour runs before they could write their final evaluation. Fall back to
+    # the first candidate instead: the run is already past saving at that point, but it
+    # reaches the end of train() and evaluates its best saved checkpoint.
+    if not torch.isfinite(batch_q_stack).all():
+        print(f"WARNING: non-finite Q values in select_action; falling back to candidate 0.",
+              flush=True)
+        q_idx = torch.tensor([0], device=batch_q_stack.device)
     # Check if batch_q_stack has shape (1, 1)
-    if batch_q_stack.shape == (1, 1):
+    elif batch_q_stack.shape == (1, 1):
         # Directly use index 0 if both dimensions are 1
         q_idx = torch.tensor([0], device=batch_q_stack.device)
     else:
@@ -1358,9 +1410,13 @@ def compute_sequence_lengths_differentiable(sequences, eos_token=4, epsilon=1e-6
     # Stack the list into a tensor
     cum_prod = torch.cat(cum_prod_list, dim=-1)  # Shape: (..., seq_len)
 
-    # Compute sequence lengths
+    # Compute sequence lengths. Deliberately NOT floored: torch.floor has zero gradient
+    # everywhere, so rounding here made this function -- whose whole purpose is to be
+    # differentiable -- return a constant with respect to the parameters. Both consumers
+    # (invalid_actions_weight and sequence_length_weight) add their penalty to actor_loss,
+    # so with the floor in place those terms were logged but contributed no gradient and
+    # could not influence training at all. The soft length is what the penalties want.
     lengths = torch.sum(cum_prod, dim=-1)
-    lengths = torch.floor(lengths)
 
     return lengths
 
@@ -1656,7 +1712,8 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                               deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder,
                               decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
                               decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout,
-                              decoder_use_cuda_graph=cfg.decoder_use_cuda_graph)
+                              decoder_use_cuda_graph=cfg.decoder_use_cuda_graph,
+                              decoder_soft_token_feedback=cfg.decoder_soft_token_feedback)
     
     # Set decoder to training mode if training end-to-end
     if cfg.train_decoder_end_to_end:
@@ -1990,11 +2047,33 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                         unique_next_state_target_action_list_final = [np.array(arr) for arr in
                                                                       unique_next_state_target_action_list_final]
 
+                        # NOTE: next_state_embeddings is (batch, n_heads, embedding_dim), and
+                        # dim=2 reduces the *head* axis, not the embedding axis -- so this is
+                        # not embedding similarity between states. At n_heads=1 the vectors
+                        # have length 1 and cosine degenerates to sign agreement; at n_heads=5
+                        # it compares a different quantity entirely, which is why A2 reported
+                        # 0.952 against a 1-head baseline of 0.619 (see §9). Kept unchanged so
+                        # historical runs stay comparable -- the §8.6 MLP-vs-GPT trajectory
+                        # (1.0 -> 0.507 vs 0.706 -> 0.619) is in these units.
                         cosine_similarity_all_pairs = torch.cosine_similarity(next_state_embeddings.unsqueeze(1),
                                                                               next_state_embeddings.unsqueeze(0),
                                                                               dim=2)
                         cosine_similarity_all_pairs_mean = cosine_similarity_all_pairs.mean().item()
                         cosine_similarity_between_first_to_others_mean = cosine_similarity_all_pairs[0].mean().item()
+
+                        # Correct version: pairwise cosine between the per-state embeddings of
+                        # head 0, reduced over the embedding axis, with self-pairs excluded.
+                        # 1.0 means the actor emits the same embedding for every state. This is
+                        # the quantity check_z_influence.py reports (0.7783 on earthy-bird-16),
+                        # so the two are directly comparable, and it is comparable across head
+                        # counts -- which the metric above is not.
+                        head0_embeddings = F.normalize(next_state_embeddings[:, 0, :], p=2, dim=1)
+                        head0_similarity = head0_embeddings @ head0_embeddings.T
+                        off_diagonal_mask = ~torch.eye(head0_similarity.shape[0], dtype=torch.bool,
+                                                       device=head0_similarity.device)
+                        actor_embedding_cosine = head0_similarity[off_diagonal_mask].mean().item()
+                        print(f"actor embedding cosine (head 0, excl. self): {actor_embedding_cosine}")
+                        writer.add_scalar("actor/embedding_cosine", actor_embedding_cosine, global_step)
 
                         _, counts = torch.unique(batch_next_observations.clone().cpu(), dim=0, return_counts=True)
                         num_same_states = (counts > 1).sum().item()
@@ -2134,6 +2213,15 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                     if cfg.train_decoder_end_to_end:
                         decoder_optimizer.zero_grad()
                     actor_loss.backward()
+
+                    # Clip before the gradient-monitoring block below, so the norms it logs
+                    # are the ones actually applied.
+                    if cfg.actor_grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(actor_network.parameters(),
+                                                       cfg.actor_grad_clip)
+                        if cfg.train_decoder_end_to_end:
+                            torch.nn.utils.clip_grad_norm_(decoder.model.parameters(),
+                                                           cfg.actor_grad_clip)
 
                     # Gradient monitoring
                     if global_step > 10 and global_step % 250 == 0:
