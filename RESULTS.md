@@ -140,3 +140,20 @@ residual stream and absorbs a uniform rescale in its weights.
    so the −0.035/−0.038 gaps in Table 1 are not distinguishable from ties.
 6. **Deterministic inference** costs ~0.10 normally but 0.33–0.39 at 100 pairs, where the
    policy leans on sampling noise. Report which pass you are quoting.
+7. **Training budgets differ by cell in Table 1.** The MLP gets 1M steps everywhere. The GPT
+   gets 1M on `16x16_empty`, `room_v1` and both obstacle maps — the cells where a 500k run
+   was still improving at its budget wall (best validation at 470k–499,999) — and 500k on
+   `8x8_empty`, `corridors` and `24x24_empty`, where it had already converged (best
+   validation at 425k, ~200k and 230k–295k respectively, followed by decline). Giving those
+   three 1M would not change them. The 500k figures for the other four were materially
+   lower (e.g. obstacles_25p 0.505 → 0.915) and should not be quoted.
+
+---
+
+## In flight — not a result yet
+
+A candidate fix for `24x24_empty` is running on branch `normalize-test`
+(`--decoder_normalize_z`, see `EVIDENCE.md` §10). It pins `‖z‖` to a learnable constant
+before the decoder projects it, targeting the magnitude deficit in Table 6. Nothing in the
+tables above depends on it, and it must not be reported as a result until its runs land and
+the three regression maps are confirmed unchanged.
