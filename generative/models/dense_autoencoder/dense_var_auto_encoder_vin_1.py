@@ -3,14 +3,22 @@ import os
 import pickle
 import random
 from collections import defaultdict, Counter
-from typing import List, Union, Tuple
+from typing import List, Optional, Union, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Laplace
 from torch.nn.utils.rnn import pad_sequence
+
+# Support both `python -m ...` / package imports and running this file directly
+# (the __main__ training block below), which would otherwise break the relative import.
+try:
+    from .mingpt_decoder import GPT, GPTConfig
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from mingpt_decoder import GPT, GPTConfig
 
 N_ACTIONS = 4
 VAR = 1
@@ -47,10 +55,23 @@ class TensorCache:
 
 class DenseVAE(nn.Module):
     def __init__(self, input_length: int, n_words: int, device: torch.device,
-                 variance_for_sample: int = 1, decoder_input_size: int = 16):
+                 variance_for_sample: int = 1, decoder_input_size: int = 16,
+                 decoder_n_layer: int = 2, decoder_n_head: int = 4, decoder_n_embd: int = 32,
+                 decoder_dropout: Optional[float] = None):
+        """
+        Args:
+            decoder_n_layer / decoder_n_head / decoder_n_embd: size of the Transformer
+                decoder trunk. Exposed so the shape can be swept from the command line --
+                the autoregressive decode loop costs one trunk pass per token, so n_layer
+                is close to a linear knob on decoder wall-clock time.
+            decoder_dropout: if given, overrides all three GPT dropout rates at once.
+                ``None`` keeps minGPT's own defaults.
+        """
         super().__init__()
         self.decoder_input_size = decoder_input_size
         self.device = device
+        self.input_length = input_length
+        self.n_words = n_words
 
         self.encoder = torch.nn.Sequential(
             torch.nn.Linear(input_length * n_words, self.decoder_input_size * 2),
@@ -64,24 +85,34 @@ class DenseVAE(nn.Module):
             torch.nn.Tanh()
         )
 
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(self.decoder_input_size, self.decoder_input_size),
-            torch.nn.InstanceNorm1d(self.decoder_input_size),
-            torch.nn.LeakyReLU(0.2),
-            torch.nn.Linear(self.decoder_input_size, self.decoder_input_size * 2),
-            torch.nn.InstanceNorm1d(self.decoder_input_size * 2),
-            torch.nn.LeakyReLU(0.2),
-            torch.nn.Linear(self.decoder_input_size * 2, input_length * n_words),
-            torch.nn.InstanceNorm1d(input_length * n_words),
-        )
-        self.decoder_last_layer = nn.Sigmoid()
-
         self.mean_layer = nn.Linear(self.decoder_input_size, self.decoder_input_size)
         self.logvar_layer = nn.Linear(self.decoder_input_size, self.decoder_input_size)
         self.norm = torch.distributions.Normal(0, variance_for_sample)
-        
-        # Initialize weights to match Actor/Critic initialization strategy
+
+        # Initialize the encoder / mean / logvar weights with the existing strategy.
+        # NOTE: this runs *before* the GPT decoder is built so that the Transformer keeps
+        # minGPT's own (normal, std=0.02) initialisation rather than the Kaiming scheme.
         self.apply(self._init_weights)
+
+        # Decoder: a small causal Transformer conditioned on the latent z (replaces the
+        # previous MLP). z is projected to a prefix token and the action sequence is
+        # generated autoregressively. block_size == input_length, vocab_size == n_words.
+        gpt_kwargs = dict(
+            vocab_size=n_words,
+            block_size=input_length,
+            decoder_input_size=decoder_input_size,
+            n_layer=decoder_n_layer,
+            n_head=decoder_n_head,
+            n_embd=decoder_n_embd,
+        )
+        if decoder_dropout is not None:
+            gpt_kwargs.update(
+                embd_pdrop=decoder_dropout,
+                resid_pdrop=decoder_dropout,
+                attn_pdrop=decoder_dropout,
+            )
+        self.gpt_config = GPTConfig(**gpt_kwargs)
+        self.decoder = GPT(self.gpt_config)
 
     def _init_weights(self, module):
         """Initialize weights using Kaiming initialization for LeakyReLU networks."""
@@ -98,22 +129,45 @@ class DenseVAE(nn.Module):
         mean, logvar = self.mean_layer(x), self.logvar_layer(x)
         return mean, logvar
 
-    def decode(self, x):
-        logits = self.decoder(x)
-        return self.decoder_last_layer(logits), logits
+    def decode(self, z: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """Teacher-forced decode through the conditional Transformer.
+
+        Args:
+            z: latent vector, shape (B, decoder_input_size).
+            idx: ground-truth integer tokens for teacher forcing, shape (B, T).
+
+        Returns:
+            Vocabulary logits of shape (B, T + 1, n_words). Position 0 is produced from
+            the z-prefix token (it predicts the first action); positions 1..T are fed by
+            the input tokens.
+        """
+        logits, _ = self.decoder(z, idx)
+        return logits
 
     def reparameterization(self, mean, var):
         epsilon = self.norm.sample(var.shape).to(self.device)
         z = mean + var * epsilon
         return z
 
-    def forward(self, x, get_z: bool = False):
-        mean, logvar = self.encode(x)
+    def forward(self, x: torch.Tensor, get_z: bool = False):
+        """Encode a token sequence, sample z, and teacher-force the decoder.
+
+        Args:
+            x: integer token indices of shape (B, T) (T == input_length, padded).
+            get_z: also return the sampled latent vector.
+
+        Returns:
+            (logits, mean, logvar[, z]) where logits has shape (B, T + 1, n_words).
+        """
+        x = x.long()
+        # The encoder still consumes a flattened one-hot view of the sequence.
+        enc_in = F.one_hot(x, num_classes=self.n_words).float().flatten(1)
+        mean, logvar = self.encode(enc_in)
         z = self.reparameterization(mean, logvar)
-        x_hat, x_hat_logits = self.decode(z)
+        logits = self.decode(z, x)  # teacher forcing on the ground-truth tokens
         if get_z:
-            return x_hat, mean, logvar, x_hat_logits, z
-        return x_hat, mean, logvar, x_hat_logits
+            return logits, mean, logvar, z
+        return logits, mean, logvar
 
     @staticmethod
     def convert_action_list_to_one_hot_tensor(action_list: List[int]) -> torch.Tensor:
@@ -123,9 +177,12 @@ class DenseVAE(nn.Module):
         return one_hot
 
     def get_reconstructed_action_list_with_embedding(self, action_l: List[int]):
-        one_hot_action = self.convert_action_list_to_one_hot_tensor(action_list=action_l)
-        x_hat, _, _, embedding, _ = self.forward(x=one_hot_action.flatten().unsqueeze(0), get_z=True)
-        reconstructed_action_seq = x_hat.reshape(len(action_l), N_ACTIONS + 1).argmax(-1)
+        # Feed integer tokens directly; the Transformer decoder is teacher-forced on them.
+        tokens = torch.tensor(action_l, dtype=torch.long, device=self.device).unsqueeze(0)  # (1, T)
+        logits, _, _, embedding = self.forward(x=tokens, get_z=True)
+        # logits[:, t] predicts token t (the z-prefix supplies the +1 shift), so the first
+        # T logit positions correspond to the T reconstructed actions.
+        reconstructed_action_seq = logits[:, :tokens.size(1), :].argmax(-1).squeeze(0)
         return reconstructed_action_seq, embedding
 
 
@@ -155,11 +212,14 @@ class DenseVAE(nn.Module):
 
 class MazeDataLoaderV2:
     def __init__(self, f_names_list: List[str], augment_more_data: bool = False, use_one_hot: bool = True, padding_val: int = None,
-                 ae_input_size: int = 10, merge_all_into_train: bool = False):
+                 ae_input_size: int = 10, merge_all_into_train: bool = False, return_token_indices: bool = True):
         self.f_name_l = f_names_list
         self.bs = 1
         self.use_one_hot = use_one_hot
-        self.input_size = 5 if use_one_hot else 1
+        # Token-index mode emits a single integer class id per step (for the Transformer's
+        # nn.Embedding / CrossEntropyLoss); otherwise we keep the legacy one-hot/scalar width.
+        self.return_token_indices = return_token_indices
+        self.input_size = 1 if return_token_indices else (5 if use_one_hot else 1)
         self.n_actions = N_ACTIONS
         self.padding = padding_val if padding_val else 4
         self.ae_input_size = ae_input_size
@@ -167,7 +227,10 @@ class MazeDataLoaderV2:
         self.augment_more_data = augment_more_data
         self.merge_all_into_train = merge_all_into_train
 
-    def convert_action(self, action: int) -> Union[float, np.array]:
+    def convert_action(self, action: int) -> Union[int, float, np.array]:
+        if self.return_token_indices:
+            # Integer class index (0..n_actions) consumed by nn.Embedding / CrossEntropyLoss.
+            return int(action)
         if self.use_one_hot:
             coding = np.zeros(self.n_actions + 1)
             coding[action] = 1.0
@@ -203,8 +266,12 @@ class MazeDataLoaderV2:
                 chunk = [[c[initial: initial + chosen_cut] for initial in initials[idx]] for idx, c in enumerate(chunk)]
             chunk = [self.convert_action(act) for act in chunk[0]]
             chunk = self.pad(chunk, self.ae_input_size)
-            chunk_arr = np.array(chunk)
-            chunk_torch = torch.from_numpy(chunk_arr).type(torch.FloatTensor)
+            if self.return_token_indices:
+                # (seq_len,) integer tokens; stacking a batch yields (B, seq_len).
+                chunk_torch = torch.tensor(chunk, dtype=torch.long)
+            else:
+                chunk_arr = np.array(chunk)
+                chunk_torch = torch.from_numpy(chunk_arr).type(torch.FloatTensor)
             chunks.append(chunk_torch)
         return chunks
 
@@ -297,7 +364,9 @@ class MazeDataLoaderV2:
         val_torch = self.prepare_list(val_df, cat='validation', n_samples=1, col='episode')
         test_torch = self.prepare_list(test_df, cat='test', col='episode')
 
-        if self.augment_more_data:
+        if self.augment_more_data and not self.return_token_indices:
+            # This soft-label jitter (writing floats into the one-hot tensor) only makes
+            # sense for the one-hot representation, not for integer token indices.
             updated_train_torch = []
             for action_seq, action_seq_len in zip(train_torch, train_df.len):
                 if action_seq_len <= 5:  # augment data for short sequences only
@@ -417,12 +486,30 @@ def evaluate_k_seq_in_decoder(decoder, action_db_path: str, n_samples: int = 100
             print(f"total length distribution: {[(k, np.round(v/n_samples, 3)) for (k,v) in sorted(Counter(action_seq_size_l).items())]}")
 
 
-def loss_function(x, x_hat, mean, log_var, x_seq_len, desired_var, smoothing=0.1):
-    smoothed_labels = x * (1 - smoothing) + smoothing / 2
+def loss_function(logits, targets, mean, log_var, desired_var, label_smoothing=0.1):
+    """Autoregressive reconstruction (cross-entropy) + KLD for the Transformer VAE.
 
-    seq_len_tensor = torch.stack(x_seq_len) if isinstance(x_seq_len, list) else x_seq_len
-    reproduction_loss = (nn.functional.binary_cross_entropy(x_hat, smoothed_labels, reduction='none').sum(-1) / seq_len_tensor).sum()
-    KLD = -0.5 * torch.sum(1+log_var - (1/desired_var) * (mean.pow(2) + log_var.exp()) - np.log(desired_var))
+    Args:
+        logits: decoder output of shape (B, T + 1, vocab). Position 0 is produced from the
+            z-prefix token; positions 1..T are produced from the teacher-forced tokens.
+        targets: ground-truth integer tokens of shape (B, T).
+        mean, log_var: latent posterior parameters, shape (B, latent_dim).
+        desired_var: target prior variance for the KLD term.
+        label_smoothing: cross-entropy label smoothing.
+
+    The +1 autoregressive shift is supplied by the z-prefix sitting at position 0: the
+    logit at position t predicts token t, so the first T logit positions are aligned with
+    all T targets (equivalently, feeding [z, x_0..x_{T-1}] predicts [x_0..x_{T-1}]).
+    """
+    seq_len = targets.size(1)
+    shifted_logits = logits[:, :seq_len, :]  # (B, T, vocab)
+    reproduction_loss = F.cross_entropy(
+        shifted_logits.reshape(-1, shifted_logits.size(-1)),
+        targets.reshape(-1),
+        label_smoothing=label_smoothing,
+        reduction='sum',
+    )
+    KLD = -0.5 * torch.sum(1 + log_var - (1 / desired_var) * (mean.pow(2) + log_var.exp()) - np.log(desired_var))
     return reproduction_loss + KLD
 
 

@@ -235,6 +235,15 @@ class Config:
     """whether to use batch normalization in the actor's linear layers"""
     actor_weight_decay: float = 1e-4
     """the weight decay for the actor's network"""
+    actor_grad_clip: float = 0.0
+    """if > 0, clip the global gradient norm of the actor (and, in end-to-end mode, the
+       decoder) to this value before stepping. Off by default. Typical actor gradient norms
+       are 0.2-0.4, so a clip around 1.0 only bites on spikes. Motivated by two runs that
+       destabilised the *actor* specifically: a larger decoder (n_layer 3 / n_embd 64)
+       NaN'd at step 159k with the NaN appearing in cnn.0.weight, and actor_learning_rate
+       3e-4 scored 0.445. Both amplify what reaches the actor. Note this is preventive, not
+       curative: clipping cannot repair a gradient that is already NaN, it only limits the
+       growth that leads there"""
     pe_embedding_dim: int = 128
     """the embedding dimension of the position encoding for concatenation with the CNN output in the actor network. Set to -1 to disable position encoding."""
     exclude_decoder_from_computation_graph: bool = False
@@ -270,6 +279,32 @@ class Config:
     """model path of pretrained VAE decoder"""
     n_actions_in_seq: int = 10
     """the number of actions in the decoder output"""
+    decoder_n_layer: int = 2
+    """number of Transformer blocks in the minGPT decoder trunk. The decoder is run
+       autoregressively (one trunk pass per generated token), so this is close to a linear
+       knob on decoder wall-clock cost"""
+    decoder_n_head: int = 4
+    """number of attention heads in the minGPT decoder (must divide decoder_n_embd)"""
+    decoder_n_embd: int = 32
+    """embedding / hidden width of the minGPT decoder"""
+    decoder_dropout: float = 0.0
+    """dropout rate applied to the minGPT decoder's embeddings, attention and residuals.
+       Defaults to 0 to match the old MLP decoder, which had no dropout at all: any
+       non-zero value adds noise to generated action sequences on every path where the
+       decoder is in train mode"""
+    decoder_use_cuda_graph: bool = False
+    """replay the decoder's autoregressive decode loop from a captured CUDA graph on the
+       gradient-free paths (action selection, target-Q, evaluation). The loop issues ~550
+       tiny kernels per call and is almost entirely dispatch overhead, so this is worth
+       ~8x at batch 1 and ~2x at batch 256. The actor update stays eager so gradients
+       still flow. Requires CUDA; falls back to eager with a warning if capture fails"""
+    decoder_soft_token_feedback: bool = False
+    """feed the emitted one-hot row back into the next decode step instead of a detached
+       argmax index. Generation is unchanged (for a one-hot row, row @ tok_emb.weight ==
+       tok_emb(argmax)); only the backward pass differs, letting the critic's gradient
+       reach z through all 10 positions rather than only the prefix token. Aimed at the
+       actor failing to learn state-dependent embeddings -- see §8.6 of
+       TRANSFORMER_INTEGRATION.md. Only applies to the one-hot emission modes"""
     use_gumble_in_decoder: bool = True
     """
     If True, the decoder's `gen_action_seq` function uses the Gumbel-Softmax method, which preserves gradients for backpropagation.
@@ -478,6 +513,13 @@ def eval_model(
     if critic is not None:
         critic.eval()
 
+    # The decoder must be evaluated deterministically too. The old MLP decoder had no
+    # dropout layers, so its train/eval mode was a no-op and nothing here ever set it;
+    # the Transformer decoder does have dropout, and leaving it in train mode injects
+    # noise into every generated sequence at evaluation time.
+    decoder_was_training = decoder.model.training
+    decoder.model.eval()
+
     eval_episodes = len(dataset)
 
     obs, obs_info = envs.reset()
@@ -660,6 +702,9 @@ def eval_model(
 
     envs.close()
 
+    if decoder_was_training:
+        decoder.model.train()
+
     if verbose_stats:
         return np.asarray(episodic_returns), np.asarray(episodic_successes), np.asarray(episodic_num_decoder_generations), \
                np.asarray(avg_valid_actions_in_sequences_list), np.asarray(avg_unused_actions_in_sequences_list), np.asarray(avg_agent_step_ratio_in_sequences_list), \
@@ -720,8 +765,37 @@ def eval_with_pretrained_model(
     else:
         critic = None
 
-    episodic_returns, episodic_successes, episodic_num_decoder_generations, episodic_avg_valid_actions_in_sequences, \
-    episodic_avg_unused_actions_in_sequences, episodic_avg_agent_step_ratio_in_sequences, all_env_eval_stats, successful_episode_inference_times, successful_episode_wall_clock_times_per_optimal_step = eval_model(cfg, dataset, run_name, actor, decoder, device, capture_video, critic=critic, verbose_stats=True, deterministic_eval=deterministic_evaluation)
+    # The actor and critic above are loaded from the best-on-validation checkpoint, but
+    # ``decoder`` arrives as the *live* object. With a frozen pretrained decoder those are
+    # the same weights, so this never mattered -- under --train_decoder_end_to_end they are
+    # not: the decoder kept training after that checkpoint was written, so the evaluation
+    # would pair a best-on-validation actor with whatever state the decoder happened to end
+    # in. Load the decoder that was saved alongside them.
+    saved_decoder_state = None
+    if cfg.train_decoder_end_to_end and critic_model_path is not None:
+        decoder_model_path = critic_model_path.replace('/critic', '/decoder')
+        if os.path.isfile(decoder_model_path):
+            saved_decoder_state = copy.deepcopy(decoder.model.state_dict())
+            decoder.model.load_state_dict(torch.load(decoder_model_path, map_location=device))
+            print(f"loaded matching decoder checkpoint from {decoder_model_path}")
+        else:
+            print(f"WARNING: {decoder_model_path} not found; evaluating with the live "
+                  f"decoder, which does not match the actor/critic checkpoint.")
+
+    decoder_was_training = decoder.model.training
+    decoder.model.eval()
+
+    try:
+        episodic_returns, episodic_successes, episodic_num_decoder_generations, episodic_avg_valid_actions_in_sequences, \
+            episodic_avg_unused_actions_in_sequences, episodic_avg_agent_step_ratio_in_sequences, all_env_eval_stats, successful_episode_inference_times, successful_episode_wall_clock_times_per_optimal_step = eval_model(cfg, dataset, run_name, actor, decoder, device, capture_video, critic=critic, verbose_stats=True, deterministic_eval=deterministic_evaluation)
+    finally:
+        # Put the caller's decoder back exactly as it was: this function is also called
+        # mid-training (eval_test_dataset_during_training_freq), where swapping in a
+        # checkpoint and leaving it there would corrupt the run that follows.
+        if saved_decoder_state is not None:
+            decoder.model.load_state_dict(saved_decoder_state)
+        if decoder_was_training:
+            decoder.model.train()
 
     # Calculate inference timing statistics for successful episodes only
     total_episodes = len(episodic_returns)
@@ -1047,21 +1121,48 @@ def eval_test_dataset(test_dataset: list[tuple[PositionXY, PositionXY, int]],
             for idx, agent_step_ratio in enumerate(episodic_avg_agent_step_ratio_in_sequences):
                 c_writer.add_scalar(f"{c_tag_name}/episodic_agent_step_ratio", agent_step_ratio, idx)
 
-        c_writer.add_scalar(f"{c_tag_name}/mean_episodic_return", np.round(np.mean(episodic_returns), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_episodic_success", np.round(np.mean(episodic_successes), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_decoder_generations", np.round(np.mean(episodic_num_decoder_generations), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_valid_actions_per_sequence_in_episode", np.round(np.mean(episodic_avg_valid_actions_in_sequences), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_num_unused_actions_per_sequence_in_episode", np.round(np.mean(episodic_avg_unused_actions_in_sequences), 3))
-        c_writer.add_scalar(f"{c_tag_name}/mean_agent_step_ratio_per_sequence_in_episode", np.round(np.mean(episodic_avg_agent_step_ratio_in_sequences), 3))
-        
-        # Add timing statistics to logs (successful episodes only)
-        c_writer.add_scalar(f"{c_tag_name}/avg_wall_clock_time_per_optimal_step", timing_stats['avg_wall_clock_time_per_optimal_step'])
-        c_writer.add_scalar(f"{c_tag_name}/std_wall_clock_time_per_optimal_step", timing_stats['std_wall_clock_time_per_optimal_step'])
-        c_writer.add_scalar(f"{c_tag_name}/avg_inference_time_per_decision_successful", timing_stats['avg_inference_time_per_decision_successful'])
-        c_writer.add_scalar(f"{c_tag_name}/std_inference_time_per_decision_successful", timing_stats['std_inference_time_per_decision_successful'])
-        c_writer.add_scalar(f"{c_tag_name}/total_episodes", timing_stats['total_episodes'])
-        c_writer.add_scalar(f"{c_tag_name}/successful_episodes", timing_stats['successful_episodes'])
-        c_writer.add_scalar(f"{c_tag_name}/total_decisions_successful", timing_stats['total_decisions_successful'])
+        test_metrics = {
+            f"{c_tag_name}/mean_episodic_return": np.round(np.mean(episodic_returns), 3),
+            f"{c_tag_name}/mean_episodic_success": np.round(np.mean(episodic_successes), 3),
+            f"{c_tag_name}/mean_num_decoder_generations": np.round(np.mean(episodic_num_decoder_generations), 3),
+            f"{c_tag_name}/mean_num_valid_actions_per_sequence_in_episode": np.round(np.mean(episodic_avg_valid_actions_in_sequences), 3),
+            f"{c_tag_name}/mean_num_unused_actions_per_sequence_in_episode": np.round(np.mean(episodic_avg_unused_actions_in_sequences), 3),
+            f"{c_tag_name}/mean_agent_step_ratio_per_sequence_in_episode": np.round(np.mean(episodic_avg_agent_step_ratio_in_sequences), 3),
+            # Timing statistics (successful episodes only)
+            f"{c_tag_name}/avg_wall_clock_time_per_optimal_step": timing_stats['avg_wall_clock_time_per_optimal_step'],
+            f"{c_tag_name}/std_wall_clock_time_per_optimal_step": timing_stats['std_wall_clock_time_per_optimal_step'],
+            f"{c_tag_name}/avg_inference_time_per_decision_successful": timing_stats['avg_inference_time_per_decision_successful'],
+            f"{c_tag_name}/std_inference_time_per_decision_successful": timing_stats['std_inference_time_per_decision_successful'],
+            f"{c_tag_name}/total_episodes": timing_stats['total_episodes'],
+            f"{c_tag_name}/successful_episodes": timing_stats['successful_episodes'],
+            f"{c_tag_name}/total_decisions_successful": timing_stats['total_decisions_successful'],
+        }
+
+        for metric_name, metric_value in test_metrics.items():
+            c_writer.add_scalar(metric_name, metric_value)
+
+        # Mirror the same numbers into wandb's run summary.
+        #
+        # The add_scalar calls above pass no step, so tensorboard records them at step 0 --
+        # but by the time the final test evaluation runs, the run's step counter is at
+        # total_timesteps. wandb requires non-decreasing steps when syncing tensorboard, so
+        # these land behind the run and never appear as columns: the headline test numbers
+        # were only ever readable by grepping the slurm log.
+        #
+        # Summary values carry no step, so they surface directly in the runs table. Keys
+        # are identical to the tensorboard tags, e.g.
+        #   test-eval-with-critic/mean_episodic_success
+        #   test-eval-with-critic-deterministic/mean_episodic_success
+        if c_cfg.track:
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.run.summary.update(
+                        {k: float(v) for k, v in test_metrics.items()}
+                    )
+            except Exception as exc:  # pragma: no cover - logging must not break evaluation
+                print(f"[GPS] (wandb summary update skipped: {exc})", flush=True)
 
         if len(all_env_eval_stats) > 0:
             writer.add_scalar(
@@ -1223,8 +1324,17 @@ def eval_candidates_with_critic(action_list_batch: torch.Tensor, action_list_pro
 
 def select_action(action_list_batch: torch.Tensor, action_list_proba_batch: torch.Tensor, batch_q_stack, cfg: Config, rng_sample_from_candidates: random.Random) -> \
 tuple[torch.Tensor, torch.Tensor]:
+    # A non-finite Q value makes both branches below fail -- torch.multinomial raises
+    # "probability tensor contains either `inf`, `nan` or element < 0" outright, which
+    # killed three 3-hour runs before they could write their final evaluation. Fall back to
+    # the first candidate instead: the run is already past saving at that point, but it
+    # reaches the end of train() and evaluates its best saved checkpoint.
+    if not torch.isfinite(batch_q_stack).all():
+        print(f"WARNING: non-finite Q values in select_action; falling back to candidate 0.",
+              flush=True)
+        q_idx = torch.tensor([0], device=batch_q_stack.device)
     # Check if batch_q_stack has shape (1, 1)
-    if batch_q_stack.shape == (1, 1):
+    elif batch_q_stack.shape == (1, 1):
         # Directly use index 0 if both dimensions are 1
         q_idx = torch.tensor([0], device=batch_q_stack.device)
     else:
@@ -1300,9 +1410,13 @@ def compute_sequence_lengths_differentiable(sequences, eos_token=4, epsilon=1e-6
     # Stack the list into a tensor
     cum_prod = torch.cat(cum_prod_list, dim=-1)  # Shape: (..., seq_len)
 
-    # Compute sequence lengths
+    # Compute sequence lengths. Deliberately NOT floored: torch.floor has zero gradient
+    # everywhere, so rounding here made this function -- whose whole purpose is to be
+    # differentiable -- return a constant with respect to the parameters. Both consumers
+    # (invalid_actions_weight and sequence_length_weight) add their penalty to actor_loss,
+    # so with the floor in place those terms were logged but contributed no gradient and
+    # could not influence training at all. The soft length is what the penalties want.
     lengths = torch.sum(cum_prod, dim=-1)
-    lengths = torch.floor(lengths)
 
     return lengths
 
@@ -1595,7 +1709,11 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
     load_pretrained_decoder = cfg.initialize_decoder_from_pretrained or not cfg.train_decoder_end_to_end
     decoder = get_decoder_api(decoder_model_path=cfg.decoder_model_path, decoder_seq_len=cfg.n_actions_in_seq, device=device, maze_n_actions=4,
                               use_gumble_in_decoder=cfg.use_gumble_in_decoder, penalize_cyclic_position_revisits=cfg.penalize_cyclic_position_revisits,
-                              deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder)
+                              deterministic_inference=cfg.deterministic_inference, load_pretrained_weights=load_pretrained_decoder,
+                              decoder_n_layer=cfg.decoder_n_layer, decoder_n_head=cfg.decoder_n_head,
+                              decoder_n_embd=cfg.decoder_n_embd, decoder_dropout=cfg.decoder_dropout,
+                              decoder_use_cuda_graph=cfg.decoder_use_cuda_graph,
+                              decoder_soft_token_feedback=cfg.decoder_soft_token_feedback)
     
     # Set decoder to training mode if training end-to-end
     if cfg.train_decoder_end_to_end:
@@ -1929,11 +2047,33 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                         unique_next_state_target_action_list_final = [np.array(arr) for arr in
                                                                       unique_next_state_target_action_list_final]
 
+                        # NOTE: next_state_embeddings is (batch, n_heads, embedding_dim), and
+                        # dim=2 reduces the *head* axis, not the embedding axis -- so this is
+                        # not embedding similarity between states. At n_heads=1 the vectors
+                        # have length 1 and cosine degenerates to sign agreement; at n_heads=5
+                        # it compares a different quantity entirely, which is why A2 reported
+                        # 0.952 against a 1-head baseline of 0.619 (see §9). Kept unchanged so
+                        # historical runs stay comparable -- the §8.6 MLP-vs-GPT trajectory
+                        # (1.0 -> 0.507 vs 0.706 -> 0.619) is in these units.
                         cosine_similarity_all_pairs = torch.cosine_similarity(next_state_embeddings.unsqueeze(1),
                                                                               next_state_embeddings.unsqueeze(0),
                                                                               dim=2)
                         cosine_similarity_all_pairs_mean = cosine_similarity_all_pairs.mean().item()
                         cosine_similarity_between_first_to_others_mean = cosine_similarity_all_pairs[0].mean().item()
+
+                        # Correct version: pairwise cosine between the per-state embeddings of
+                        # head 0, reduced over the embedding axis, with self-pairs excluded.
+                        # 1.0 means the actor emits the same embedding for every state. This is
+                        # the quantity check_z_influence.py reports (0.7783 on earthy-bird-16),
+                        # so the two are directly comparable, and it is comparable across head
+                        # counts -- which the metric above is not.
+                        head0_embeddings = F.normalize(next_state_embeddings[:, 0, :], p=2, dim=1)
+                        head0_similarity = head0_embeddings @ head0_embeddings.T
+                        off_diagonal_mask = ~torch.eye(head0_similarity.shape[0], dtype=torch.bool,
+                                                       device=head0_similarity.device)
+                        actor_embedding_cosine = head0_similarity[off_diagonal_mask].mean().item()
+                        print(f"actor embedding cosine (head 0, excl. self): {actor_embedding_cosine}")
+                        writer.add_scalar("actor/embedding_cosine", actor_embedding_cosine, global_step)
 
                         _, counts = torch.unique(batch_next_observations.clone().cpu(), dim=0, return_counts=True)
                         num_same_states = (counts > 1).sum().item()
@@ -2066,7 +2206,22 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                         actor_weights = copy.deepcopy(actor_network.state_dict())
 
                     actor_optimizer.zero_grad()
+                    # The decoder sits inside the actor's computation graph when training
+                    # end-to-end, so its gradients must be cleared on the same schedule as
+                    # the actor's -- otherwise every backward adds to the previous ones and
+                    # the optimizer steps along a running sum instead of the current grad.
+                    if cfg.train_decoder_end_to_end:
+                        decoder_optimizer.zero_grad()
                     actor_loss.backward()
+
+                    # Clip before the gradient-monitoring block below, so the norms it logs
+                    # are the ones actually applied.
+                    if cfg.actor_grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(actor_network.parameters(),
+                                                       cfg.actor_grad_clip)
+                        if cfg.train_decoder_end_to_end:
+                            torch.nn.utils.clip_grad_norm_(decoder.model.parameters(),
+                                                           cfg.actor_grad_clip)
 
                     # Gradient monitoring
                     if global_step > 10 and global_step % 250 == 0:
@@ -2086,7 +2241,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
 
                         if math.isnan(total_norm) or math.isinf(total_norm):
                             print(f"Warning: Actor Gradient norm is {total_norm}")
-                            return
+                            continue_training = False
 
                         # Log gradient statistics
                         for name, param in actor_network.named_parameters():
@@ -2101,7 +2256,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                                 # Check for NaN or inf
                                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                                     print(f'Actor: NaN or inf detected in gradients of layer: {name}')
-                                    return
+                                    continue_training = False
 
                         total_norm = 0
                         parameters = [p for p in decoder.model.decoder.parameters() if
@@ -2120,7 +2275,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
 
                         if math.isnan(total_norm) or math.isinf(total_norm):
                             print(f"Warning: Decoder Gradient norm is {total_norm}.")
-                            return
+                            continue_training = False
 
                         for name, param in decoder.model.decoder.named_parameters():
                             if param.grad is not None:
@@ -2134,7 +2289,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                                 # Check for NaN or inf
                                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                                     print(f'Decoder: NaN or inf detected in gradients of layer: {name}')
-                                    return
+                                    continue_training = False
 
                         total_norm = 0
                         parameters = [p for p in critic_network.parameters() if p.grad is not None and p.requires_grad]
@@ -2152,7 +2307,7 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
 
                         if math.isnan(total_norm) or math.isinf(total_norm):
                             print(f"Warning: Critic Gradient norm is {total_norm}.")
-                            return
+                            continue_training = False
 
                         for name, param in critic_network.named_parameters():
                             if param.grad is not None:
@@ -2166,10 +2321,24 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                                 # Check for NaN or inf
                                 if torch.isnan(grad).any() or torch.isinf(grad).any():
                                     print(f'Critic: NaN or inf detected in gradients of layer: {name}')
-                                    return
+                                    continue_training = False
+
+                    # A non-finite gradient makes this update meaningless, so skip the
+                    # optimizer steps and unwind the training loop. The bare `return` this
+                    # replaces did skip the steps, but it also abandoned the rest of
+                    # train() -- including the final test evaluation -- so a run that
+                    # destabilised partway through exited 0, reported "Finished", and
+                    # produced no test numbers at all despite its best-on-validation
+                    # checkpoints already being on disk. Unwinding instead reaches the end
+                    # of train(), where that evaluation runs against those checkpoints.
+                    if not continue_training:
+                        print(f"[GPS] aborting training at global_step={global_step} after a "
+                              f"non-finite gradient. Running the final test evaluation on the "
+                              f"best-on-validation checkpoints saved so far.", flush=True)
+                        break
 
                     actor_optimizer.step()
-                    
+
                     # Update decoder if training end-to-end
                     if cfg.train_decoder_end_to_end:
                         decoder_optimizer.step()
@@ -2343,9 +2512,19 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                 if cfg.evaluate_actor_diversity_every_k_epochs > 0 and global_step % run_evaluation_k == 0:
                     with torch.no_grad():
                         current_fixed_embedding = actor_network(fixed_obs_tensor)
-                        action_list_batch, action_list_proba_batch = decoder.gen_action_seq(
+                        # Use local names here. This diagnostic decode used to assign to
+                        # action_list_batch / action_list_proba_batch, which are the
+                        # acting loop's variables -- and because it calls gen_action_seq
+                        # without get_actions_as_one_hot, it returns (None, probs), so it
+                        # left action_list_batch as None. If the episode happened to end
+                        # on the same step, the verbose episode logger below then did
+                        # None.argmax(-1) and killed the run. Intermittent by nature: it
+                        # needs a step that is a multiple of evaluate_actor_diversity_every_k_epochs
+                        # AND an episode ending on it (observed at global_step=650000,
+                        # i.e. 13 x 50000, on job 22379902).
+                        _, diversity_action_probas = decoder.gen_action_seq(
                             gen_input=current_fixed_embedding)
-                        action_seq_per_state = action_list_proba_batch.argmax(-1).view(fixed_obs_tensor.shape[0],
+                        action_seq_per_state = diversity_action_probas.argmax(-1).view(fixed_obs_tensor.shape[0],
                                                                                        cfg.n_proto_plan_candidates,
                                                                                        cfg.n_actions_in_seq)
                         trimmed_sequences = [[DenseVAE.trim_action_sequence_from_eos_tokens(seq)[0] for seq in batch]
@@ -2461,8 +2640,11 @@ def train(cfg: Config, run_name: str, writer: SummaryWriter, log_dir: str):
                     )
 
 
-            if not continue_training:
-                break
+        # Dedented out of the `len(sequence_obs) > 1` block above so that an abort always
+        # unwinds: a sequence that took no environment steps would otherwise skip this
+        # check and keep the outer loop running.
+        if not continue_training:
+            break
 
     if not cfg.save_model or (cfg.val_eval_freq < 0 and cfg.save_model):
         torch.save(target_actor_network.state_dict(), actor_model_path)
