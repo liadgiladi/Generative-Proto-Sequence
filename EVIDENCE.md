@@ -9,6 +9,9 @@ earned themselves through failed runs. Full technical detail is in
 is about (replanning frequency), where to find it, and how it has to be qualified. Leading
 with success rate will produce a misleading document.
 
+**§10 is a refuted fix** for the one failing environment. Read it before proposing anything
+that normalises or rescales the actor's latent `z`.
+
 Branch: `transformer-integration` (PR #2 against `liadgiladi:main`, draft).
 Task: from-scratch end-to-end RL (`--train_decoder_end_to_end
 --no-initialize_decoder_from_pretrained`) across all 7 maps the repo ships — §8.
@@ -413,7 +416,9 @@ failure, and the length penalty confirmed load-bearing rather than harmful.
 
 1. **Re-generate the sequence-level metrics from the 1M logs.** §8 and §9's `gen/ep`, step
    ratio and plan-length figures are all from the 500k runs. One `compare_runs.py` call.
-2. **`24x24_empty` — diagnosed, one step from a fix.** The decoder is healthy there; the
+2. **`24x24_empty` — diagnosed; the obvious fix is REFUTED, see §10.** Normalising `z`'s
+   magnitude neither helped 24x24 nor left a working map intact, because `z` magnitude turns
+   out to carry state information. The decoder is healthy there; the
    actor's `z` is 2.8× narrower than on a working map, and the actor reaches only 23% of the
    decoder's plan range against room's 43% (§8). Two things left, both cheap:
    - **re-run `check_z_influence.py` on both checkpoints** and read the new `std / norm`
@@ -842,3 +847,93 @@ Generate all of them with:
 ```bash
 python compare_runs.py --csv all_maps.csv sbatch/logs/j1_*.out sbatch/logs/j2_*.out
 ```
+
+---
+
+## 10. REFUTED — normalising `z` magnitude (`--decoder_normalize_z`)
+
+**Do not re-propose this.** It was derived from a measurement, implemented, tested on four
+maps, and it does not work. The refutation is informative and constrains what a real fix can
+look like — read it before designing one.
+
+The code lives on branch **`normalize-test`** and is deliberately **not** on this branch:
+every number in §1–§9 predates it and none of them depend on it.
+
+### The hypothesis
+
+§8 diagnosed `24x24_empty` (GPT 0.110 n=2 vs MLP 0.973): the decoder is healthy there
+(64/256 unique plans from random `z`, better than a working map's 60) and the actor has
+**not** collapsed — its `z` carries the same relative variety as on a working map
+(`std/norm` 0.1246 vs 0.1306, within 5%) at **2.7× smaller magnitude** (norm 0.0782 vs
+0.2079), reaching only 23% of the decoder's plan range against room's 43%.
+
+`z` enters the Transformer as a prefix token competing with fixed-scale token embeddings in
+a residual stream that is **not** normalised (§6.4), so a small `z` is drowned out. The MLP
+decoder has no residual stream and absorbs a uniform rescale in its weights. That asymmetry
+predicts the failure exactly.
+
+### The change
+
+`--decoder_normalize_z` (default off) + `--decoder_z_scale_init` (default 0.2). In
+`GPT._project_z`, `z` is rescaled to a learnable fixed norm before `z_proj`:
+
+```python
+z = z / (z.norm(p=2, dim=-1, keepdim=True) + 1e-6) * self.z_scale
+```
+
+Verified offline before launching: flag off is **bit-identical** to the historical path;
+flag on is magnitude-invariant (logits for `z` at room's norm vs 24x24's differ by 0.26 off,
+**2e-6** on). A plain `nn.LayerNorm` was rejected because unit per-dim variance would scale
+the prefix ~19× beyond what `z_proj`'s init was tuned for.
+
+### The result — it does not work
+
+Validation at the point both prior 24x24 seeds had already peaked:
+
+| map | step | best val with the flag | without |
+|---|---|---|---|
+| **24x24_empty** | 241k | **0.18** | 0.21 / 0.24 at 230k–295k |
+| **16x16_room_v1** | 402k | **0.39** | ~0.7–0.8 by this step (0.81 @500k, 0.99 @1M) |
+| 16x16_corridors_v1 | 446k | 1.0 | 1.0 — unchanged |
+| 16x16_empty | 460k | 1.0 | 1.0 — unchanged |
+
+**No gain on the target map, and a large regression on room.** Corridors and 16x16_empty sit
+at the 1.0 ceiling, so they cannot show harm either way — **`room_v1` was the only
+informative regression cell, and it moved.** Choose regression maps that have headroom.
+
+### Why — and what it rules out
+
+Mean pairwise cosine between `z` vectors is **0.76**: they point in broadly similar
+directions. When directions are that similar, much of how the actor distinguishes one state
+from another must live in the **magnitude**. Normalising `‖z‖` to a constant deletes exactly
+that, which is what room's −0.4 is measuring.
+
+**So `z` magnitude is state information, not an artifact.** An earlier version of this
+section argued the opposite ("its scale is incidental, like any conditioning signal"). Room
+refutes it.
+
+This rules out the whole family of fixes that *replace* `‖z‖` with a constant — L2
+normalisation, LayerNorm, RMSNorm on `z`. A viable repair has to raise the **global** scale
+while preserving **per-state relative** magnitude: a learnable gain (`z * g`), or
+standardising the norm against a running batch average rather than against a fixed target.
+Neither is tested.
+
+(One alternative not separable from a single run: normalising also changes the gradient
+geometry, so room's regression could be an optimisation effect rather than information loss.
+Distinguishing them needs the learnable-gain variant above, which preserves the information
+and changes only the scale.)
+
+### Status of the §8 diagnosis
+
+**Unaffected.** 24x24's `z` really is 2.7× smaller with the same relative spread, and the
+actor still reaches only 23% of the decoder's plan range there. What this experiment removes
+is one candidate *repair*, not the diagnosis.
+
+The other live explanation is the **plan-repertoire limit** — 15–26 distinct plans across
+256 states (§8) — which also explains why the GPT is flat at ~0.50 across four maps of very
+different difficulty at 100 pairs. That is the constraint an adaptive-replanning mechanism
+addresses, and it is now the leading one.
+
+> **Preliminary:** the table above is validation at 241k–460k steps, read while the four runs
+> were still going (jobs 24060410–13). The direction is unambiguous but the final test
+> numbers are not in yet. Update this section when they land.
