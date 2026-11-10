@@ -82,8 +82,12 @@ Transformer wins only on corridors. Full table and the three sub-findings in **�
   0.505 → 0.915 at 1M
 - the length penalty is **load-bearing**, not the cause of the fixed-plan behaviour: at
   `weight 0` the agent collapses to 0.20–0.24 on every cluttered map
-- `24x24_empty` is the one genuine, reproducible failure and is not explained by coverage,
-  horizon or the penalty
+- `24x24_empty` is diagnosed: the decoder is healthy there, but the actor's `z` is 2.7×
+  smaller **in magnitude, not in variety** (`std/norm` is identical to a working map), so the
+  prefix is drowned out in an unnormalised residual stream
+- at **100 pairs** the Transformer is flat at ~0.50 across four maps (range 0.033, below the
+  noise floor) while the MLP ranges 0.40–0.93 — it is insensitive to map difficulty, because
+  a ~20-plan repertoire cannot span what an open map needs
 
 > **Writing this up? Read §9 first.** `decoder generations per episode` is the headline
 > metric for the replanning thesis, not success rate — §9 says what it means, where to find
@@ -611,6 +615,57 @@ action quality.
 **Coverage is not the explanatory variable** for any of this — the MLP scores 0.973 on
 24x24_empty at **0.8%**. Coverage explains only why corridors at 100 pairs looked starved
 (§1.1).
+
+#### The 100-pair axis — the Transformer is blind to map difficulty
+
+The same four maps at the paper's 100-pair protocol, both arms at 1M steps:
+
+| map | coverage | GPT | MLP | gap |
+|---|---|---|---|---|
+| 16x16_empty | 0.6% | 0.520 | **0.930** | −0.410 |
+| 16x16_obstacles_v1_15p | 0.9% | 0.497 | **0.636** | −0.139 |
+| 16x16_room_v1 | 1.2% | 0.515 | 0.507 | +0.008 |
+| 16x16_obstacles_v1_25p | 1.3% | **0.487** | 0.399 | **+0.088** |
+
+**2–2, and the GPT wins on the hardest map while losing badly on the easiest.** But the
+scores are not the finding — the *variances* are:
+
+| | range across the four maps |
+|---|---|
+| **GPT** | 0.487–0.520 = **0.033** (below the 0.042 noise floor) |
+| MLP | 0.399–0.930 = **0.531** |
+
+**The Transformer scores statistically the same on an empty grid and on 25% clutter.** It is
+insensitive to map difficulty. The MLP tracks difficulty exactly as expected (0.930 empty →
+0.636 light clutter → 0.507 rooms → 0.399 heavy clutter), which is what a decoder actually
+solving the navigation problem looks like.
+
+**Why the empty maps are the GPT's worst case — and it is not coverage.** Empty maps have
+the most free cells, so a fixed pair count buys the *least* coverage there; yet the MLP does
+**better** with less data when the map is open (0.930 at 0.6%) than with more data when it is
+cluttered (0.636 at 0.9%). On an open grid the optimal plan is a smooth function of the
+goal's relative offset, so 100 examples teach a rule that generalises. Clutter shatters that
+rule into special cases.
+
+The Transformer cannot exploit that regularity, because an open map needs a near-continuum of
+plans and the actor supplies only **15–26 distinct ones across 256 states** (§8 diagnosis
+above). Walls do the constraining for it; open space does not. **Its bottleneck — plan
+diversity — bites hardest exactly where diversity matters most.** This is also why corridors
+is its best map: 1-wide passages require the fewest distinct plans of any environment here.
+
+`24x24_empty` is the compounded extreme: the largest open space (most diversity required)
+*and* the smallest `z` magnitude (2.7× below a working map, so the least diversity
+delivered). Hence 0.110 rather than the ~0.50 the other starved maps give.
+
+**Falsifiable prediction:** if `--decoder_normalize_z` recovers 24x24 substantially,
+`z`-resolution was the dominant term; if it recovers only partly, the plan-repertoire limit
+is a separate and real constraint — and that is the one an adaptive-replanning mechanism
+addresses.
+
+**Caveat for reporting:** deterministic inference costs far more here than the historical
+~0.10 — 0.399/0.067 and 0.507/0.113 on two of these runs, a 0.33–0.39 drop. The policy is
+leaning on sampling noise, which is a signature of under-training rather than breakage, and
+the paper's protocol number is the deterministic one when `deterministic_inference` is true.
 
 #### The mechanism: the Transformer emits a rigid 3-action plan everywhere
 
